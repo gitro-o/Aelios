@@ -35,7 +35,7 @@ export interface MemoryExportResult {
 }
 
 // getByIds batch size — keep small to stay well under any internal limits.
-const GETBYIDS_BATCH = 50;
+const GETBYIDS_BATCH = 20;
 const EXPORT_PAGE_SIZE = 1000;
 
 function getIndexName(env: Env): string {
