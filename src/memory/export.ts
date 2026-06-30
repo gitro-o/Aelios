@@ -157,7 +157,7 @@ async function exportFromVectorize(
   let phase1Ids: string[] = [];
   try {
     const result = await env.VECTORIZE.query(zeroVector, {
-      topK: 1000,
+      topK: 100,
       namespace: input.namespace,
       returnMetadata: "indexed",
       returnValues: false,
