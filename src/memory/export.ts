@@ -119,7 +119,7 @@ function vectorMatchToExportRecord(match: VectorizeMatch): MemoryExportRecord {
  * Two-phase Vectorize export:
  *
  * Phase 1 — discover all vector IDs:
- *   query(zeroVector, {topK:1000, returnMetadata:'indexed'})
+ *   query(zeroVector, {topK:100, returnMetadata:'indexed'})
  *   'indexed' metadata (not 'all') lifts the topK≤50 restriction.
  *   This returns IDs + indexed fields (namespace, status, type, pinned, kind)
  *   but NOT content. That's fine — we only need the IDs here.
