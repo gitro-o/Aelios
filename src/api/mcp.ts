@@ -17,7 +17,7 @@ import {
 import { filterAndCompressMemories } from "../memory/filter";
 import { exportMemories } from "../memory/export";
 import { buildBootPackage, isV2Enabled, runRecall } from "../memory/v2/recall";
-import { searchMemoeries, toMemoryApiRecord } from "../memory/search";
+import { searchMemories, toMemoryApiRecord } from "../memory/search";
 import {
   createVectorMemory,
   deleteVectorMemory,
