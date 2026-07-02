@@ -17,13 +17,12 @@ import {
 import { filterAndCompressMemories } from "../memory/filter";
 import { exportMemories } from "../memory/export";
 import { buildBootPackage, isV2Enabled, runRecall } from "../memory/v2/recall";
-import { toMemoryApiRecord } from "../memory/search";
+import { searchMemoeries, toMemoryApiRecord } from "../memory/search";
 import {
   createVectorMemory,
   deleteVectorMemory,
   getVectorMemory,
-  listVectorMemories,
-  searchVectorMemories
+  listVectorMemories
 } from "../memory/vectorStore";
 import { enqueueMemoryMaintenanceIfNeeded } from "../queue/producer";
 import type { Env, KeyProfile, Scope } from "../types";
@@ -343,7 +342,7 @@ async function callTool(
     if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
     const query = readString(args.query);
     if (!query) return toolError("query is required");
-    const memories = await searchVectorMemories(env, {
+    const memories = await searchMemories(env, {
       namespace: resolveNamespace(profile, args.namespace),
       query,
       topK: readNumber(args.top_k, Number(env.MEMORY_TOP_K || 50)),
