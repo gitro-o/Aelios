@@ -12,13 +12,14 @@ import {
   updateVectorMemory
 } from "./vectorStore";
 import { isV2Enabled } from "./v2/recall";
-import { toMemoryApiRecord } from "./search";
+import { searchMemories, toMemoryApiRecord } from "./search";
 import {
   upsertMemoryByFactKey,
   supersedeMemory,
   archiveMemory,
   upsertDigest,
   createLongtail,
+  createMemoryCandidate,
   upsertDailyLog,
   fetchMemoryLifecycleRows,
   upsertLongtailEmbedding
@@ -120,6 +121,10 @@ function readDreamStrategy(env: Env): "legacy" | "upsert" | "review" {
   const raw = env.DREAM_STRATEGY;
   if (raw === "legacy" || raw === "review") return raw;
   return "upsert";
+}
+
+function shouldArchiveDreamDeletesToLongtail(env: Env): boolean {
+  return readString(env.DREAM_ARCHIVE_DELETES_TO_LONGTAIL) === "true";
 }
 
 function readFirstEnvValue(...values: unknown[]): unknown {
@@ -442,7 +447,7 @@ function buildDigestPrompt(input: {
     "- 合并重复记忆，避免同一事实以多个版本长期存在。",
     "- 发现过时、被新信息否定、互相矛盾的旧记忆，并更新或删除。",
     "- 检查当天小批抽取已经入库的记忆和旧记忆之间是否重复、过时或冲突。",
-    "- 保留关键原文摘录，重写一份简洁的 L1 摘要。",
+    "- 只在极少数必要场景提出关键原文摘录，重写一份简洁的 L1 摘要。",
     "- 形成下一次对话可直接使用的简洁记忆，而不是保存流水账。",
     "",
     "窗口：",
@@ -457,6 +462,7 @@ function buildDigestPrompt(input: {
     "- v2 的首次抽取已由每 4 小时 extractor 负责；memories_to_add 默认给空数组，不要把当天聊天首次抽取成新长期记忆。",
     "- 当多条旧记忆重复，保留更完整的一条并删除重复项；必要时先 update 保留项。",
     "- pinned=true 的旧记忆不能删除，只能在 memories_to_update 中提出更保守的补充。",
+    "- 旧记忆里的临时计划/意图（例如“打算下个月充值X”）如果已经过期、已经发生、或被当天新信息取代，优先更新成持久事实或直接删除，不要让过期的打算一直躺在库里。",
     "- 站在“我=助手”的视角写。关于用户，用“你……”；关于助手承诺，用“我需要……”。",
     "- 不要提到 D1、Vectorize、RAG、数据库、记忆系统、代理层等实现细节。",
     "",
@@ -464,9 +470,11 @@ function buildDigestPrompt(input: {
     "- title 是 12 字以内标题。",
     "- summary 写成一段简短自然中文，描述这次 dream 整理出了什么。",
     "- sections 最多 3 段，每段有 heading 和 content；没有必要可以给空数组。",
-    `- important_excerpts 最多 ${input.excerptLimit} 条，quote 必须是值得保留的原文片段。`,
+    `- important_excerpts 最多 ${input.excerptLimit} 条，quote 必须是值得人工审核的原文片段；不要把普通聊天流水、调试口令、临时玩笑放进来。`,
+    "- v2 下 important_excerpts 只会进入人工审核候选，不会自动写入长期记忆。",
     "- memories_to_add 保留兼容字段，v2 下默认输出空数组。",
     "- memories_to_update 只针对给出的旧记忆 id。",
+    "- memories_to_update 里的 type 只能从这 8 个里选：fact、event、preference、relationship、boundary、habit、decision、note；项目进展归 fact，承诺/决定归 decision。绝不输出 project、world_fact 等其他值。",
     "- memories_to_delete 只删除空、重复、明显过期或被新信息否定的旧记忆。",
     "- 控制总输出长度，宁可少写也不要输出超长 JSON。",
     "",
@@ -489,7 +497,7 @@ function buildDigestPrompt(input: {
         {
           target_id: "mem_x",
           content: "更新后的旧记忆正文",
-          type: "project",
+          type: "fact",
           importance: 0.88,
           confidence: 0.9,
           tags: ["project"]
@@ -656,6 +664,33 @@ async function saveImportantExcerpts(
   return saved;
 }
 
+async function queueImportantExcerptsForReview(
+  env: Env,
+  input: { namespace: string; dateLabel: string; excerpts: ImportantExcerpt[]; fallbackMessageIds: string[] }
+): Promise<number> {
+  let queued = 0;
+  const limit = readDreamExcerptLimit(env);
+
+  for (const excerpt of input.excerpts.slice(0, limit)) {
+    const quote = readString(excerpt.quote);
+    if (!quote) continue;
+    await createMemoryCandidate(env.DB, {
+      namespace: input.namespace,
+      type: "excerpt",
+      content: quote,
+      factKey: null,
+      importance: 0.72,
+      confidence: 0.72,
+      tags: uniqueStrings(["important-excerpt", input.dateLabel, ...(excerpt.tags ?? [])]),
+      sourceMessageIds: excerpt.source_message_ids?.length ? excerpt.source_message_ids : input.fallbackMessageIds,
+      source: "dream_excerpt"
+    });
+    queued += 1;
+  }
+
+  return queued;
+}
+
 async function applyMemoryUpdates(
   env: Env,
   input: { namespace: string; updates: DigestMemoryUpdate[]; deletes: DigestMemoryDelete[] }
@@ -731,6 +766,7 @@ async function applyDreamV2(
   const isReview = strategy === "review";
   const added = 0;
   let updated = 0, deleted = 0, longtailCount = 0;
+  const archiveDeletesToLongtail = shouldArchiveDreamDeletesToLongtail(env);
 
   if (isReview) {
     await recordDreamReviewProposal(env, { namespace, dateLabel, digest, messageIds });
@@ -774,15 +810,17 @@ async function applyDreamV2(
     const existing = await getVectorMemory(env, item.target_id);
     if (!existing || existing.status !== "active" || existing.pinned) continue;
 
-    const lt = await createLongtail(env.DB, { namespace, content: existing.content, sourceMessageIds: messageIds });
-    await upsertLongtailEmbedding(env, { id: lt.id, namespace, content: existing.content });
-    longtailCount++;
+    if (archiveDeletesToLongtail) {
+      const lt = await createLongtail(env.DB, { namespace, content: existing.content, sourceMessageIds: messageIds });
+      await upsertLongtailEmbedding(env, { id: lt.id, namespace, content: existing.content });
+      longtailCount++;
+    }
 
     const retired = await retireMemoryRecord(env, { namespace, id: item.target_id });
     if (retired) deleted++;
   }
 
-  const excerpts = await saveImportantExcerpts(env, {
+  const excerpts = await queueImportantExcerptsForReview(env, {
     namespace,
     dateLabel,
     excerpts: digest.important_excerpts ?? [],
@@ -810,6 +848,50 @@ async function applyDreamV2(
   return { added, updated, deleted, excerpts, longtail: longtailCount };
 }
 
+const DREAM_CONTEXT_QUERY_MAX_MESSAGES = 20;
+const DREAM_CONTEXT_QUERY_MAX_CHARS = 4000;
+
+function buildDreamContextQuery(messages: MessageRecord[]): string {
+  const recent = messages.slice(-DREAM_CONTEXT_QUERY_MAX_MESSAGES);
+  const text = recent
+    .map((message) => message.content.trim())
+    .filter(Boolean)
+    .join("\n");
+  return truncate(text, DREAM_CONTEXT_QUERY_MAX_CHARS);
+}
+
+// dream 的记忆上下文按“和当天聊天最相关”挑选，而不是固定翻旧记忆列表第一页——
+// listMemoriesPage 按 pinned/importance/updated_at 排序，dream 每晚只会看到同一批高分记忆，
+// 永远看不到中间层的重复项；改成用当天聊天做向量检索，才能命中真正该合并/纠正的旧记忆。
+// 搜索失败或无结果时，回退到原先的分页列表，保证 dream 不因此空转。
+async function selectDreamMemoryContext(
+  env: Env,
+  input: { namespace: string; messages: MessageRecord[]; limit: number }
+): Promise<MemoryApiRecord[]> {
+  const query = buildDreamContextQuery(input.messages);
+  if (query) {
+    try {
+      const results = await searchMemories(env, {
+        namespace: input.namespace,
+        query,
+        topK: input.limit
+      });
+      const active = results.filter((record) => record.status === "active");
+      if (active.length > 0) return active;
+    } catch (error) {
+      console.error("dream: relevance-based memory context search failed, falling back to page listing", error);
+    }
+  }
+
+  const page = await listMemoriesPage(env.DB, {
+    namespace: input.namespace,
+    status: "active",
+    limit: input.limit,
+    offset: 0
+  });
+  return page.records.map((record) => toMemoryApiRecord(record));
+}
+
 export async function runDailyMemoryDigest(
   env: Env,
   namespace: string,
@@ -829,33 +911,29 @@ export async function runDailyMemoryDigest(
   }
 
   const maxMessages = readDreamMaxMessages(env);
-  const messages = await listMessagesByNamespaceInRange(env.DB, {
+  const fetchedMessages = await listMessagesByNamespaceInRange(env.DB, {
     namespace,
     startCreatedAt: startIso,
     endCreatedAt: endIso,
     afterCreatedAt: cursorState.after,
     limit: maxMessages
   });
-  if (messages.length === 0) {
+  if (fetchedMessages.length === 0) {
     await writeCursor(env.DB, cursorName, `done:${cursorState.after ?? startIso}`);
     return { ran: false, mode: "dream", date: dateLabel, reason: "no_messages", startIso, endIso, cursor };
   }
 
-  const lastMessage = messages[messages.length - 1];
-  const hasMore = messages.length >= maxMessages;
   const memoryContextLimit = readDreamMemoryContextLimit(env);
   const strategy = readDreamStrategy(env);
   const v2Enabled = isV2Enabled(env);
   let existingMemories: MemoryApiRecord[] = [];
   try {
     if (v2Enabled && strategy !== "legacy") {
-      const page = await listMemoriesPage(env.DB, {
+      existingMemories = await selectDreamMemoryContext(env, {
         namespace,
-        status: "active",
-        limit: memoryContextLimit,
-        offset: 0
+        messages: fetchedMessages,
+        limit: memoryContextLimit
       });
-      existingMemories = page.records.map((record) => toMemoryApiRecord(record));
     } else {
       existingMemories = (await listVectorMemories(env, {
         namespace,
@@ -866,22 +944,43 @@ export async function runDailyMemoryDigest(
     console.error("dream: failed to list existing memories", error);
   }
   const cleanedEmptyMemories = v2Enabled && strategy === "review" ? 0 : await cleanEmptyMemories(env, namespace);
+  const excerptLimit = readDreamExcerptLimit(env);
+  const fetchedHasMore = fetchedMessages.length >= maxMessages;
 
-  const prompt = buildDigestPrompt({
-    dateLabel,
-    startIso,
-    endIso,
-    messages,
-    existingMemories,
-    excerptLimit: readDreamExcerptLimit(env),
-    hasMore
-  });
-  const modelResult = await callDigestModel(env, prompt, {
-    dateLabel,
-    messageCount: messages.length,
-    memoryCount: existingMemories.length,
-    hasMore
-  });
+  let messages = fetchedMessages;
+  let hasMore = fetchedHasMore;
+  let modelResult: DigestModelCallResult;
+  for (;;) {
+    const prompt = buildDigestPrompt({
+      dateLabel,
+      startIso,
+      endIso,
+      messages,
+      existingMemories,
+      excerptLimit,
+      hasMore
+    });
+    modelResult = await callDigestModel(env, prompt, {
+      dateLabel,
+      messageCount: messages.length,
+      memoryCount: existingMemories.length,
+      hasMore
+    });
+    if (modelResult.digest) break;
+    if (modelResult.reason !== "model_invalid_json" || modelResult.finishReason !== "length" || messages.length <= 1) break;
+
+    const nextSize = Math.max(1, Math.floor(messages.length / 2));
+    if (nextSize >= messages.length) break;
+    console.warn("dream: retrying with smaller batch after length-truncated JSON", {
+      date: dateLabel,
+      previousMessageCount: messages.length,
+      nextMessageCount: nextSize,
+      model: modelResult.model
+    });
+    messages = messages.slice(0, nextSize);
+    hasMore = true;
+  }
+
   const digest = modelResult.digest;
   if (!digest) {
     console.error("dream: model did not return valid JSON; cursor not advanced", {
@@ -903,6 +1002,7 @@ export async function runDailyMemoryDigest(
       finishReason: modelResult.finishReason
     };
   }
+  const lastMessage = messages[messages.length - 1];
   const messageIds = messages.map((message) => message.id);
 
   // v2 path: fact_key upsert + L1 digest + longtail + yesterday_log

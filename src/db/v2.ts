@@ -7,6 +7,7 @@
 // 同步用 embedding.ts 的 upsertMemoryEmbedding / deleteMemoryEmbedding (已带 kind:"memory")。
 
 import { upsertMemoryEmbedding } from "../memory/embedding";
+import { clampMemoryType } from "../memory/canonicalTypes";
 import type { Env, MemoryLifecycleRow, MemoryRecord } from "../types";
 import { newId } from "../utils/ids";
 import { nowIso } from "../utils/time";
@@ -166,14 +167,19 @@ export async function markPreciousInjected(
   db: D1Database,
   input: { namespace: string; ids: string[] }
 ): Promise<void> {
-  if (input.ids.length === 0) return;
-  const placeholders = input.ids.map(() => "?").join(", ");
-  await db
-    .prepare(
-      `UPDATE precious SET last_injected_at = ? WHERE namespace = ? AND id IN (${placeholders})`
-    )
-    .bind(nowIso(), input.namespace, ...input.ids)
-    .run();
+  const ids = uniqueStrings(input.ids);
+  if (ids.length === 0) return;
+  const stamp = nowIso();
+  for (let i = 0; i < ids.length; i += SQLITE_BIND_BATCH_SIZE) {
+    const batch = ids.slice(i, i + SQLITE_BIND_BATCH_SIZE);
+    const placeholders = batch.map(() => "?").join(", ");
+    await db
+      .prepare(
+        `UPDATE precious SET last_injected_at = ? WHERE namespace = ? AND id IN (${placeholders})`
+      )
+      .bind(stamp, input.namespace, ...batch)
+      .run();
+  }
 }
 
 // =====================================================================
@@ -395,6 +401,70 @@ export async function listLongtail(
   return result.results ?? [];
 }
 
+export async function fetchLongtailByIds(
+  db: D1Database,
+  input: { namespace: string; ids: string[] }
+): Promise<LongtailRow[]> {
+  const ids = [...new Set(input.ids.map((id) => id.trim()).filter(Boolean))];
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(", ");
+  const result = await db
+    .prepare(
+      `SELECT id, namespace, content, ts, source_message_ids
+       FROM longtail
+       WHERE namespace = ? AND id IN (${placeholders})`
+    )
+    .bind(input.namespace, ...ids)
+    .all<LongtailRow>();
+  return result.results ?? [];
+}
+
+function candidateLongtailRecordIds(id: string): string[] {
+  const trimmed = id.trim();
+  if (!trimmed) return [];
+  const ids = [trimmed];
+  if (trimmed.startsWith("lt_lt_")) ids.push(trimmed.slice("lt_".length));
+  return [...new Set(ids)];
+}
+
+function candidateLongtailVectorIds(id: string): string[] {
+  return [...new Set(candidateLongtailRecordIds(id).flatMap((recordId) => [recordId, `lt_${recordId}`]))];
+}
+
+export async function deleteLongtail(
+  env: Env,
+  input: { namespace: string; id: string }
+): Promise<"deleted" | "not_found" | "vector_error"> {
+  const recordIds = candidateLongtailRecordIds(input.id);
+  if (recordIds.length === 0) return "not_found";
+  const placeholders = recordIds.map(() => "?").join(", ");
+  const existing = await env.DB
+    .prepare(`SELECT id FROM longtail WHERE namespace = ? AND id IN (${placeholders}) LIMIT 1`)
+    .bind(input.namespace, ...recordIds)
+    .first<{ id: string }>();
+
+  if (env.VECTORIZE) {
+    try {
+      const vectorIds = [
+        ...candidateLongtailVectorIds(input.id),
+        ...(existing ? candidateLongtailVectorIds(existing.id) : [])
+      ];
+      await env.VECTORIZE.deleteByIds([...new Set(vectorIds)]);
+    } catch (error) {
+      console.error("longtail vector delete failed, keeping D1 row", { id: input.id, error });
+      return "vector_error";
+    }
+  }
+
+  if (!existing) return "deleted";
+
+  await env.DB
+    .prepare("DELETE FROM longtail WHERE namespace = ? AND id = ?")
+    .bind(input.namespace, existing.id)
+    .run();
+  return "deleted";
+}
+
 export interface MemoryTypeCount {
   type: string;
   count: number;
@@ -415,6 +485,39 @@ export async function countActiveMemoriesByType(
     .bind(namespace)
     .all<MemoryTypeCount>();
   return result.results ?? [];
+}
+
+// L4 每区硬上限用：单个 type 当前 active 条数。
+export async function countActiveMemoriesOfType(
+  db: D1Database,
+  input: { namespace: string; type: string }
+): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(*) AS count FROM memories WHERE namespace = ? AND status = 'active' AND type = ?")
+    .bind(input.namespace, input.type)
+    .first<{ count: number }>();
+  return row?.count ?? 0;
+}
+
+// 抽取器判重用：库里已有的 fact_key 列表，防止同一件事被重复造 key。
+// fact_key 存在 memory_lifecycle 侧车表，不在 memories 本体 (见文件头注释)，所以要 join。
+export async function listActiveFactKeys(
+  db: D1Database,
+  input: { namespace: string; limit?: number }
+): Promise<string[]> {
+  const limit = Math.min(Math.max(Math.floor(input.limit ?? 300), 1), 1000);
+  const result = await db
+    .prepare(
+      `SELECT DISTINCT lc.fact_key AS fact_key
+       FROM memories m
+       JOIN memory_lifecycle lc ON lc.memory_id = m.id
+       WHERE m.namespace = ? AND m.status = 'active' AND lc.fact_key IS NOT NULL AND lc.fact_key != ''
+       ORDER BY lc.fact_key
+       LIMIT ?`
+    )
+    .bind(input.namespace, limit)
+    .all<{ fact_key: string }>();
+  return (result.results ?? []).map((row) => row.fact_key);
 }
 
 export interface MemoryCandidateRow {
@@ -456,7 +559,7 @@ export async function createMemoryCandidate(
   const record: MemoryCandidateRow = {
     id,
     namespace: input.namespace,
-    type: input.type || "note",
+    type: clampMemoryType(input.type, "note"),
     content: input.content,
     fact_key: input.factKey ?? null,
     confidence: input.confidence ?? 0.5,
@@ -589,7 +692,11 @@ export interface MemoryV2Patch {
   validAsOf?: string | null;
 }
 
-const SQLITE_BIND_BATCH_SIZE = 100;
+// D1 limits each statement to 100 bound variables. Some batched queries bind
+// an extra leading param (e.g. last_injected_at) on top of the id placeholders,
+// so N ids bind N+1 variables. Keep the batch size under 99 to stay safe; 90
+// leaves headroom for any future extra params.
+const SQLITE_BIND_BATCH_SIZE = 90;
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim()))];
@@ -648,7 +755,7 @@ export async function upsertMemoryByFactKey(
       )
       .bind(
         input.content,
-        input.type ?? "fact",
+        clampMemoryType(input.type, "fact"),
         input.importance ?? 0.6,
         input.confidence ?? 0.8,
         JSON.stringify(input.tags ?? []),
@@ -683,7 +790,7 @@ export async function upsertMemoryByFactKey(
     .bind(
       id,
       input.namespace,
-      input.type ?? "fact",
+      clampMemoryType(input.type, "fact"),
       input.content,
       input.importance ?? 0.6,
       input.confidence ?? 0.8,
@@ -826,7 +933,7 @@ export async function supersedeMemory(
     .bind(
       nextId,
       input.namespace,
-      input.newType ?? "world_fact",
+      clampMemoryType(input.newType, "fact"),
       input.newContent,
       input.importance ?? 0.6,
       input.confidence ?? 0.8,

@@ -9,11 +9,14 @@ import { exportMemories } from "../memory/export";
 import { filterAndCompressMemoriesWithMeta } from "../memory/filter";
 import { formatMemoryPatch } from "../memory/inject";
 import { searchMemories, toMemoryApiRecord } from "../memory/search";
+import { deleteVectorMemory } from "../memory/vectorStore";
+import { clampMemoryType } from "../memory/canonicalTypes";
 import {
   countActiveMemoriesByType,
   countMemoryCandidates,
   createPrecious,
   deleteGlossary,
+  deleteLongtail,
   deletePrecious,
   updatePrecious,
   fetchMemoryLifecycleRows,
@@ -77,7 +80,7 @@ async function handleCreateMemory(
   if (!body) return openAiError("Request body must be a JSON object", 400);
 
   const content = readString(body.content);
-  const type = readString(body.type) || "note";
+  const type = clampMemoryType(readString(body.type), "note");
 
   if (!content) {
     return openAiError("content is required", 400);
@@ -540,6 +543,28 @@ export async function handleGlossaryApi(request: Request, env: Env): Promise<Res
   return openAiError("Not found", 404);
 }
 
+export async function handleLongtailApi(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
+
+  const scopeError = requireScope(auth.profile, "memory:write");
+  if (scopeError) return scopeError;
+
+  const url = new URL(request.url);
+  const namespace = resolveNamespace(auth.profile, url.searchParams.get("namespace"));
+  const parts = url.pathname.split("/").filter(Boolean);
+  const id = parts[2];
+
+  if (request.method !== "DELETE" || !id) return openAiError("Not found", 404);
+
+  const result = await deleteLongtail(env, { namespace, id });
+  if (result === "not_found") return openAiError("Longtail entry not found", 404);
+  if (result === "vector_error") {
+    return openAiError("Longtail vector delete failed", 503, "memory_error");
+  }
+  return json({ data: { id, deleted: true } });
+}
+
 async function createApprovedMemoryFromCandidate(
   env: Env,
   input: {
@@ -612,7 +637,7 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
   if (!candidate) return openAiError("Candidate not found", 404);
   const body = (await readJsonObject(request)) ?? {};
   const content = readString(body.content) || candidate.content;
-  const type = readString(body.type) || candidate.type;
+  const type = clampMemoryType(readString(body.type) || candidate.type, "note");
   const factKey = body.fact_key === null ? null : readString(body.fact_key) ?? candidate.fact_key;
   const confidence = readNumber(body.confidence, candidate.confidence);
   const importance = readNumber(body.importance, candidate.importance);
@@ -777,7 +802,11 @@ async function handleDeleteMemory(
   if (scopeError) return scopeError;
 
   const existing = await getMemoryById(env.DB, { namespace: profile.namespace, id });
-  if (!existing || existing.namespace !== profile.namespace) return openAiError("Memory not found", 404);
+  if (!existing || existing.namespace !== profile.namespace) {
+    const deletedLegacyVector = await deleteVectorMemory(env, id);
+    if (deletedLegacyVector) return json({ data: { id, deleted: true, source: "legacy_vectorize" } });
+    return openAiError("Memory not found", 404);
+  }
 
   const deleted = await softDeleteMemory(env.DB, { namespace: profile.namespace, id });
   if (deleted) await deleteMemoryEmbeddingBestEffort(env, deleted);

@@ -1,7 +1,7 @@
 import { handleAdmin } from "./api/admin";
 import { handleHealth } from "./api/health";
 import { handleCache } from "./api/cache";
-import { handleCacheHealth, handleVectorHealth, handleVectorReindex } from "./api/debug";
+import { handleCacheHealth, handleVectorDoctor, handleVectorHealth, handleVectorReindex } from "./api/debug";
 import { handleChatCompletions } from "./api/chatCompletions";
 import { handleGuideDogChatCompletions } from "./api/guideDog";
 import {
@@ -10,11 +10,13 @@ import {
   handleMemories,
   handleMemoryBoot,
   handleMemoryCandidates,
+  handleLongtailApi,
   handlePrecious,
   handleSearchMemoriesApi
 } from "./api/memories";
 import { handleMcp } from "./api/mcp";
 import { handleModels } from "./api/models";
+import { runCandidateJudge } from "./memory/candidateJudge";
 import { runDailyMemoryDigest } from "./memory/dailyDigest";
 import { runMemoryExtractionBatches } from "./memory/extractPipeline";
 import { runMemoryRetention } from "./memory/retention";
@@ -103,6 +105,10 @@ export default {
       return handleGlossaryApi(request, env);
     }
 
+    if (url.pathname.startsWith("/v1/longtail/")) {
+      return handleLongtailApi(request, env);
+    }
+
     if (url.pathname === "/v1/candidates" || url.pathname.startsWith("/v1/candidates/")) {
       return handleMemoryCandidates(request, env);
     }
@@ -134,6 +140,10 @@ export default {
       return handleVectorReindex(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/vector-doctor") {
+      return handleVectorDoctor(request, env);
+    }
+
     return openAiError("Not found", 404);
   },
 
@@ -157,15 +167,36 @@ export default {
     const tasks: Array<Promise<unknown>> = [];
 
     if (shouldRunExtract) {
-      tasks.push(runMemoryExtractionBatches(env, namespace, { scheduledTime: controller.scheduledTime }));
+      // 候选队列自动评审跟在抽取批次后面跑，同一个 namespace，避免跟本轮刚写入的
+      // pending 候选抢跑。CANDIDATE_JUDGE_ENABLED 默认关闭，关闭时这里直接跳过，
+      // 不调用 runCandidateJudge，disabled = 零额外开销。
+      tasks.push(
+        runMemoryExtractionBatches(env, namespace, { scheduledTime: controller.scheduledTime }).then(
+          async (extraction) => {
+            if (env.CANDIDATE_JUDGE_ENABLED !== "true") return { extraction };
+            const judge = await runCandidateJudge(env, namespace);
+            return { extraction, judge };
+          }
+        )
+      );
     }
 
     if (shouldRunDailyMaintenance) {
+      // Run dream and retention as independent tasks. Retention is best-effort
+      // cleanup: if it throws (e.g. a transient D1 error), it must NOT take the
+      // dream down with it — otherwise the dream's cursor never advances and
+      // the whole nightly maintenance silently fails. So retention gets its own
+      // .catch that swallows the rejection into a logged result, and dream is
+      // a separate top-level task that settles on its own.
+      tasks.push(runDailyMemoryDigestBatches(env, namespace));
       tasks.push(
-        Promise.all([
-          runDailyMemoryDigestBatches(env, namespace),
-          runMemoryRetention(env, namespace)
-        ]).then(([digest, retention]) => ({ digest, retention }))
+        runMemoryRetention(env, namespace).then(
+          (retention) => ({ ok: true as const, retention }),
+          (error) => {
+            console.error("scheduled memory retention failed", { namespace, error: String(error) });
+            return { ok: false as const, error: String(error) };
+          }
+        )
       );
     }
 

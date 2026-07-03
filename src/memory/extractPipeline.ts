@@ -1,8 +1,10 @@
 import { listMessagesByNamespaceInRange } from "../db/messages";
 import { readCursor, writeCursor } from "../db/retention";
 import {
+  countActiveMemoriesOfType,
   createMemoryCandidate,
   getActiveMemoryByFactKey,
+  listActiveFactKeys,
   markMemorySeen,
   supersedeMemory,
   upsertMemoryByFactKey
@@ -12,6 +14,7 @@ import type { Env, MessageRecord, OpenAIChatRequest, OpenAIChatResponse } from "
 import { createEmbedding } from "./embedding";
 import { type ExtractedMemory } from "./extract";
 import { createVectorMemory } from "./vectorStore";
+import { clampMemoryType } from "./canonicalTypes";
 import { isV2Enabled } from "./v2/recall";
 
 const DEFAULT_EXTRACT_MODEL = "deepseek/deepseek-v4-flash";
@@ -74,6 +77,13 @@ function readReviewConfidence(env: Env): number {
   const parsed = Number(env.EXTRACT_REVIEW_CONFIDENCE ?? DEFAULT_REVIEW_CONFIDENCE);
   if (!Number.isFinite(parsed)) return DEFAULT_REVIEW_CONFIDENCE;
   return Math.min(Math.max(parsed, 0), 1);
+}
+
+// L4 每区（type）硬上限：0/不设/非法 = 关闭，不影响老 fork 的默认行为。
+function readZoneCap(env: Env): number {
+  const parsed = Number(env.MEMORY_ZONE_CAP ?? 0);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.floor(parsed);
 }
 
 function readExtractModel(env: Env): string | null {
@@ -168,10 +178,12 @@ function normalizeCandidate(item: unknown): ExtractedMemory | null {
   const content = readString(raw.content);
   if (!content || content.length > 1000) return null;
   return {
-    type: readString(raw.type) || "note",
+    type: clampMemoryType(readString(raw.type)),
     content,
     importance: clampScore(raw.importance, 0.65),
-    confidence: clampScore(raw.confidence, 0.82),
+    // 缺失/非法 confidence 落到 0.5，低于 DEFAULT_REVIEW_CONFIDENCE，逼进人审队列，
+    // 不能让抽取器抽风直接绕过审核写库。
+    confidence: clampScore(raw.confidence, 0.5),
     tags: readStringArray(raw.tags),
     source_message_ids: readStringArray(raw.source_message_ids),
     fact_key: readString(raw.fact_key) ?? undefined
@@ -198,7 +210,15 @@ function formatTranscript(messages: MessageRecord[]): string {
     .join("\n\n");
 }
 
-function buildExtractPrompt(messages: MessageRecord[]): string {
+function buildExtractPrompt(messages: MessageRecord[], existingFactKeys: string[] = []): string {
+  const factKeySection = existingFactKeys.length > 0
+    ? [
+        "",
+        "库里已有的 fact_key（如果新事实和其中一个是同一件事，必须复用那个 fact_key，不要新造相似的 key；只有确实是新事实才发明新 key）：",
+        existingFactKeys.join("、")
+      ]
+    : [];
+
   return [
     "你是 Aelios 的小批量长期记忆抽取器。只做一个判断：这段对话有没有值得长期保留的稳定事实，并提炼成一句未来可直接使用的记忆。",
     "只输出 JSON，不要 markdown，不要解释，不要输出思考过程。",
@@ -209,14 +229,17 @@ function buildExtractPrompt(messages: MessageRecord[]): string {
     "- 只有用户明确说出、确认、长期表现出的事实，才能写成关于用户的记忆。",
     "- 关于用户的记忆，优先写成“你……”。关于我应遵守的长期方式，写成“我需要……”。",
     "- 每条 content 必须是一句自然短句。",
-    "- 稳定事实必须尽量给 fact_key，格式为小写 ASCII，例如 project:aelios-memory-v2、preference:answer-style、boundary:no-system-records。",
+    "- type 只能从这 8 个里选：fact、event、preference、relationship、boundary、habit、decision、note。绝不输出 project、world_fact、commitment 等其他值；项目进展归 fact，承诺/决定归 decision，习惯归 habit。",
+    "- 稳定事实必须尽量给 fact_key，格式为小写 ASCII，例如 project:aelios-memory-v2、preference:answer-style、boundary:no-system-records。fact_key 是分组键，跟 type 无关，可以带 project: preference: 等前缀。",
+    "- 临时计划和意图（例如“下个月要充值X”）不是稳定事实：要么提炼成背后的持久事实（例如“你按月轮换订阅”），要么直接跳过，不要把会过期的打算存成长期记忆。",
+    ...factKeySection,
     "",
     "输出格式：",
     JSON.stringify({
       memories: [
         {
           content: "你正在把 Aelios v2 记忆写入拆成即时捕获、小批抽取和夜间整理三档。",
-          type: "project",
+          type: "fact",
           fact_key: "project:aelios-memory-v2-write-pipeline",
           importance: 0.86,
           confidence: 0.92,
@@ -234,7 +257,7 @@ function buildExtractPrompt(messages: MessageRecord[]): string {
   ].join("\n");
 }
 
-async function callExtractModel(env: Env, messages: MessageRecord[]): Promise<ExtractModelResult> {
+async function callExtractModel(env: Env, messages: MessageRecord[], existingFactKeys: string[]): Promise<ExtractModelResult> {
   const model = readExtractModel(env);
   if (!model) return { memories: [], reason: "missing_model" };
 
@@ -242,7 +265,7 @@ async function callExtractModel(env: Env, messages: MessageRecord[]): Promise<Ex
     model,
     messages: [
       { role: "system", content: "你是严格的 JSON 生成器。你只输出 JSON。" },
-      { role: "user", content: buildExtractPrompt(messages) }
+      { role: "user", content: buildExtractPrompt(messages, existingFactKeys) }
     ],
     temperature: 0,
     max_tokens: readPositiveInt(env.EXTRACT_MAX_TOKENS, DEFAULT_MAX_TOKENS, 4000),
@@ -268,19 +291,19 @@ async function callExtractModel(env: Env, messages: MessageRecord[]): Promise<Ex
 
 async function findEmbeddingDuplicate(
   env: Env,
-  input: { namespace: string; type: string; content: string; threshold: number }
+  input: { namespace: string; content: string; threshold: number }
 ): Promise<{ id: string; score: number } | null> {
   if (!env.VECTORIZE) return null;
   const vector = await createEmbedding(env, input.content);
   if (!vector) return null;
 
+  // 不按 type 过滤：同一件事被抽成 fact 一次、note 一次时，type 过滤会让它们互相看不见，判重失效。
   const result = await env.VECTORIZE.query(vector, {
     topK: 5,
     returnMetadata: "all",
     filter: {
       namespace: input.namespace,
       kind: "memory",
-      type: input.type,
       status: "active"
     } as VectorizeVectorMetadataFilter
   } as unknown as Parameters<typeof env.VECTORIZE.query>[1]);
@@ -292,6 +315,14 @@ async function findEmbeddingDuplicate(
     if (id) return { id, score: match.score ?? 0 };
   }
   return null;
+}
+
+// L4 每区硬上限：cap 关闭或没超就放行；超了就不再新建，转人审队列 (不影响 supersede/duplicate，那两条不长区)。
+async function isZoneFull(env: Env, input: { namespace: string; type: string }): Promise<boolean> {
+  const cap = readZoneCap(env);
+  if (cap <= 0) return false;
+  const count = await countActiveMemoriesOfType(env.DB, { namespace: input.namespace, type: input.type });
+  return count >= cap;
 }
 
 async function persistCandidate(
@@ -345,6 +376,21 @@ async function persistCandidate(
       return "superseded";
     }
 
+    if (await isZoneFull(env, { namespace: input.namespace, type: input.memory.type })) {
+      await createMemoryCandidate(env.DB, {
+        namespace: input.namespace,
+        type: input.memory.type,
+        content: input.memory.content,
+        factKey: factKey || null,
+        confidence: input.memory.confidence,
+        importance: input.memory.importance,
+        tags: input.memory.tags,
+        sourceMessageIds,
+        source: "zone_full"
+      });
+      return "queued";
+    }
+
     await upsertMemoryByFactKey(env, {
       namespace: input.namespace,
       factKey,
@@ -361,13 +407,27 @@ async function persistCandidate(
 
   const duplicate = await findEmbeddingDuplicate(env, {
     namespace: input.namespace,
-    type: input.memory.type,
     content: input.memory.content,
     threshold: input.dedupCosine
   });
   if (duplicate) {
     await markMemorySeen(env.DB, { namespace: input.namespace, id: duplicate.id });
     return "duplicate";
+  }
+
+  if (await isZoneFull(env, { namespace: input.namespace, type: input.memory.type })) {
+    await createMemoryCandidate(env.DB, {
+      namespace: input.namespace,
+      type: input.memory.type,
+      content: input.memory.content,
+      factKey: null,
+      confidence: input.memory.confidence,
+      importance: input.memory.importance,
+      tags: input.memory.tags,
+      sourceMessageIds,
+      source: "zone_full"
+    });
+    return "queued";
   }
 
   await createVectorMemory(env, {
@@ -440,7 +500,8 @@ export async function runMemoryExtractionWindow(
     return { ran: false, mode: "extract", reason: "no_messages", windowEndIso: endIso, cursor };
   }
 
-  const modelResult = await callExtractModel(env, messages);
+  const existingFactKeys = await listActiveFactKeys(env.DB, { namespace });
+  const modelResult = await callExtractModel(env, messages, existingFactKeys);
   if (modelResult.reason) {
     return {
       ran: false,
@@ -480,6 +541,27 @@ export async function runMemoryExtractionWindow(
       hasMore
     }
   };
+}
+
+// eval 干跑用——走真实抽取 prompt 和归一化，不落库。
+export async function runExtractionDryRun(
+  env: Env,
+  input: { namespace: string; messages: Array<{ role: string; content: string }> }
+): Promise<{ memories: ExtractedMemory[]; model?: string; reason?: string }> {
+  const fixedCreatedAt = "2026-01-01T00:00:00.000Z";
+  const messages: MessageRecord[] = input.messages.map((message, index) => ({
+    id: `eval_${index + 1}`,
+    conversation_id: "eval",
+    namespace: input.namespace,
+    role: message.role === "system" || message.role === "assistant" || message.role === "tool" ? message.role : "user",
+    content: message.content,
+    source: "eval",
+    created_at: fixedCreatedAt
+  }));
+
+  const existingFactKeys = await listActiveFactKeys(env.DB, { namespace: input.namespace });
+  const modelResult = await callExtractModel(env, messages, existingFactKeys);
+  return { memories: modelResult.memories, model: modelResult.model, reason: modelResult.reason };
 }
 
 export async function runMemoryExtractionBatches(
