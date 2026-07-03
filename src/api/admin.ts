@@ -328,8 +328,21 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
           <template x-for="item in precious" :key="item.id">
             <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
               <div class="mb-2 flex items-center gap-2 text-xs text-zinc-400"><i data-lucide="heart" class="h-4 w-4 text-coral"></i><span x-text="fmt(item.created_at)"></span><span x-text="item.source"></span></div>
-              <p class="whitespace-pre-wrap text-sm leading-7" x-text="item.content"></p>
-              <button type="button" @click="unpinPrecious(item)" class="tap mt-3 rounded-2xl border border-zinc-800 px-4 text-sm transition duration-150 ease-in-out hover:border-coral">取消珍贵</button>
+              <template x-if="!item.editing">
+                <p class="whitespace-pre-wrap text-sm leading-7" x-text="item.content"></p>
+              </template>
+              <template x-if="item.editing">
+                <textarea x-model="item.draft.content" class="min-h-36 w-full resize-y rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3 text-sm outline-none focus:border-coral"></textarea>
+              </template>
+              <div class="mt-3 flex flex-wrap gap-2">
+                <button type="button" @click="togglePreciousEdit(item)" class="tap inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-3 text-sm transition duration-150 ease-in-out hover:border-coral">
+                  <i data-lucide="pencil" class="h-4 w-4"></i><span x-text="item.editing ? '取消' : '编辑'"></span>
+                </button>
+                <button type="button" x-show="item.editing" @click="savePrecious(item)" class="tap inline-flex items-center gap-2 rounded-2xl bg-coral px-3 text-sm font-semibold text-zinc-950">
+                  <i data-lucide="save" class="h-4 w-4"></i><span>保存</span>
+                </button>
+                <button type="button" @click="unpinPrecious(item)" class="tap ml-auto inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-3 text-sm transition duration-150 ease-in-out hover:border-coral">取消珍贵</button>
+              </div>
             </article>
           </template>
         </div>
@@ -557,7 +570,11 @@ function memoryAdmin() {
         this.stats = this.boot.stats || {};
         this.digestDraft = this.boot.digest && this.boot.digest.content ? this.boot.digest.content.slice(0, 500) : '';
         this.todayMessages = this.boot.today_messages || [];
-        this.precious = this.boot.precious || [];
+        this.precious = (this.boot.precious || []).map(function(item) {
+          item.editing = false;
+          item.draft = { content: item.content };
+          return item;
+        });
         this.glossary = this.boot.glossary || [];
         this.longtail = (this.boot.longtail || []).map(function(row) {
           return { id: row.id, type: 'longtail', status: 'v1 longtail', source: row.ts, content: row.content };
@@ -761,6 +778,23 @@ function memoryAdmin() {
         await this.request(this.withNamespace('/v1/precious/' + encodeURIComponent(item.id)), { method: 'DELETE' });
         await this.loadBoot();
         this.notify('已取消珍贵');
+      } catch (error) {
+        this.notify(error.message);
+      }
+    },
+    togglePreciousEdit(item) {
+      item.editing = !item.editing;
+      item.draft = { content: item.content };
+      this.icons();
+    },
+    async savePrecious(item) {
+      try {
+        await this.request(this.withNamespace('/v1/precious/' + encodeURIComponent(item.id)), {
+          method: 'PATCH',
+          body: JSON.stringify({ namespace: this.namespace, content: item.draft.content })
+        });
+        await this.loadBoot();
+        this.notify('已保存');
       } catch (error) {
         this.notify(error.message);
       }

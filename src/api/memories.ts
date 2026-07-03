@@ -15,6 +15,7 @@ import {
   createPrecious,
   deleteGlossary,
   deletePrecious,
+  updatePrecious,
   fetchMemoryLifecycleRows,
   getDigest,
   getDailyLog,
@@ -451,6 +452,20 @@ export async function handlePrecious(request: Request, env: Env): Promise<Respon
       source: readString(body.source) || "human"
     });
     return json({ data: row }, { status: 201 });
+  }
+
+  if (request.method === "PATCH" && id) {
+    const body = await readJsonObject(request);
+    if (!body) return openAiError("Request body must be a JSON object", 400);
+    const content = readString(body.content);
+    if (!content) return openAiError("content is required", 400);
+    const row = await updatePrecious(env.DB, {
+      namespace: resolveNamespace(auth.profile, body.namespace),
+      id,
+      content
+    });
+    if (!row) return openAiError("Precious memory not found", 404);
+    return json({ data: row });
   }
 
   if (request.method === "DELETE" && id) {

@@ -150,6 +150,17 @@ export async function deletePrecious(
   return (r.meta?.changes ?? 0) > 0;
 }
 
+export async function updatePrecious(
+  db: D1Database,
+  input: { namespace: string; id: string; content: string }
+): Promise<PreciousRow | null> {
+  await db
+    .prepare("UPDATE precious SET content = ? WHERE namespace = ? AND id = ?")
+    .bind(input.content, input.namespace, input.id)
+    .run();
+  return getPreciousById(db, { namespace: input.namespace, id: input.id });
+}
+
 // 闸三：记 last_injected_at，近期注入过的降权 (不动 importance/pinned)。
 export async function markPreciousInjected(
   db: D1Database,
