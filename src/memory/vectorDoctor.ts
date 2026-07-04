@@ -24,7 +24,9 @@ import { createEmbedding } from "./embedding";
 import type { Env } from "../types";
 import { RETENTION_BATCH_SIZE } from "../db/retention";
 
-const GETBYIDS_BATCH = 50;
+// Vectorize getByIds 硬限制：单次最多 20 个 id (VECTOR_GET_ERROR 40007)。
+// 跟 export.ts 的 GETBYIDS_BATCH 保持同值。
+const GETBYIDS_BATCH = 20;
 // D1 单条语句绑定变量上限，IN (...) 批量查询保持在这个数以下 (跟 db/v2.ts 的
 // SQLITE_BIND_BATCH_SIZE 同一个理由：留出余量，别顶到 D1 的硬限制)。
 const D1_LOOKUP_BATCH = 90;
@@ -135,7 +137,9 @@ async function enumerateNamespaceVectors(
   let phase1Ids: string[] = [];
   try {
     const result = await env.VECTORIZE.query(zeroVector, {
-      topK: input.limit,
+      // Vectorize query 硬限制：topK 最大 100 (VECTOR_QUERY_ERROR 40011)，
+      // 即便 returnMetadata:'indexed' 也一样。超过 100 的 limit 在这里钳住。
+      topK: Math.min(input.limit, 100),
       namespace: input.namespace,
       returnMetadata: "indexed",
       returnValues: false,
