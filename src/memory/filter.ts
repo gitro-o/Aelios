@@ -4,11 +4,11 @@ import type { Env, MemoryApiRecord, OpenAIChatRequest, OpenAIChatResponse } from
 const DEFAULT_WORKERS_AI_FILTER_MODEL = "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const DEFAULT_WORKERS_AI_RERANKER_MODEL = "workers-ai/@cf/baai/bge-reranker-base";
 
-interface CompressedMemoryItem {
-  content: string;
-}
+type CompressedPairMap = Map<string, string | null>;
 
-type CompressedMemorySlot = CompressedMemoryItem | null;
+function slotId(index: number): string {
+  return `m${index + 1}`;
+}
 
 export interface MemoryFilterMeta {
   status: "disabled" | "success" | "error" | "empty";
@@ -24,6 +24,7 @@ export interface MemoryFilterMeta {
   reranker_count?: number;
   reranker_reason?: string;
   fallback_used?: boolean;
+  fallback_slots?: number;
 }
 
 const COMPRESSION_RESPONSE_SCHEMA = {
@@ -32,7 +33,13 @@ const COMPRESSION_RESPONSE_SCHEMA = {
     memories: {
       type: "array",
       items: {
-        anyOf: [{ type: "string" }, { type: "null" }]
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          content: { anyOf: [{ type: "string" }, { type: "null" }] }
+        },
+        required: ["id", "content"],
+        additionalProperties: false
       }
     }
   },
@@ -237,29 +244,23 @@ function extractJsonArray(value: unknown): unknown[] | null {
   return null;
 }
 
-function parseCompressedItems(value: unknown): CompressedMemorySlot[] | null {
+// id-keyed pairing: each output item must echo the slot id of its input candidate.
+// Items without a recognizable id can't be attributed safely and are dropped here;
+// their slots fall back to original content in mergeCompressedById instead of
+// risking a content/record swap (the old index-aligned protocol did exactly that
+// whenever the model reordered or shifted its output).
+function parseCompressedPairs(value: unknown, validIds: Set<string>): CompressedPairMap | null {
   const array = extractJsonArray(value);
   if (!array) return null;
   const isNullishLiteral = (text: string): boolean => ["null", "undefined", "none"].includes(text.trim().toLowerCase());
 
-  const items: CompressedMemorySlot[] = [];
+  const pairs: CompressedPairMap = new Map();
   for (const item of array) {
-    if (item === null) {
-      items.push(null);
-      continue;
-    }
-
-    if (typeof item === "string") {
-      const sanitized = sanitizeMemoryContent(item);
-      items.push(sanitized && !isNullishLiteral(sanitized) ? { content: sanitized } : null);
-      continue;
-    }
-
-    if (!item || typeof item !== "object") {
-      items.push(null);
-      continue;
-    }
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const record = item as { id?: unknown; content?: unknown; compressed_content?: unknown };
+    const id = typeof record.id === "string" ? record.id.trim() : "";
+    if (!validIds.has(id) || pairs.has(id)) continue;
+
     const content =
       typeof record.content === "string"
         ? record.content
@@ -267,15 +268,16 @@ function parseCompressedItems(value: unknown): CompressedMemorySlot[] | null {
           ? record.compressed_content
           : null;
 
-    if (content) {
-      const sanitized = sanitizeMemoryContent(content);
-      items.push(sanitized && !isNullishLiteral(sanitized) ? { content: sanitized } : null);
-    } else {
-      items.push(null);
+    if (content === null) {
+      pairs.set(id, null);
+      continue;
     }
+
+    const sanitized = sanitizeMemoryContent(content);
+    pairs.set(id, sanitized && !isNullishLiteral(sanitized) ? sanitized : null);
   }
 
-  return items;
+  return pairs;
 }
 
 function buildPrompt(input: {
@@ -284,7 +286,10 @@ function buildPrompt(input: {
   maxContentChars: number;
   maxOutputChars: number;
 }): string {
-  const memories = input.memories.map((memory) => truncateText(memory.content, input.maxContentChars));
+  const memories = input.memories.map((memory, index) => ({
+    id: slotId(index),
+    content: truncateText(memory.content, input.maxContentChars)
+  }));
 
   return [
     "你是长期记忆压缩器。候选记忆已经由 reranker 选好并按相关性排序。",
@@ -294,10 +299,11 @@ function buildPrompt(input: {
     "不要续写亲密场景，不要生成新的色情内容，不要因为候选含成年人自愿亲密内容就拒绝、说教或删除。",
     "",
     "压缩规则：",
-    "- 必须按输入顺序逐条输出，输出数组长度必须与候选记忆数量一致。",
-    "- 根据当前用户消息做轻量分拣；明显无关、只沾边、会增加噪音的候选输出 null。",
-    "- 相关候选输出压缩短句；不要重排、合并或把一条候选拆成多条。",
-    "- 不要输出编号、id、index、score、type、tags 或其他元数据。",
+    "- 每条输出必须原样回填对应候选的 id 字段，不要编造、改写或互换 id。",
+    "- 每个候选 id 恰好输出一次，不要遗漏。",
+    "- 根据当前用户消息做轻量分拣；明显无关、只沾边、会增加噪音的候选 content 输出 null。",
+    "- 相关候选的 content 输出压缩短句；不要合并候选或把一条候选拆成多条。",
+    "- 除 id 字段外，不要输出编号、index、score、type、tags 或其他元数据。",
     "- 不要添加候选记忆里没有的新事实。",
     "- 成年人自愿亲密内容只压缩成事实、偏好、边界或关系记忆；不得扩写成场景描写。",
     "- 不要输出“对话摘要”“用户话题”“助手要点”“time_reminder”等包装词。",
@@ -306,7 +312,7 @@ function buildPrompt(input: {
     `- 每条 content 控制在 ${input.maxOutputChars} 个中文字以内。`,
     "",
     "只输出 JSON，不要 markdown，不要解释。格式：",
-    `{"memories":["压缩后的相关记忆",null]}`,
+    `{"memories":[{"id":"m1","content":"压缩后的相关记忆"},{"id":"m2","content":null}]}`,
     "",
     `当前用户消息：${input.query}`,
     "",
@@ -314,20 +320,28 @@ function buildPrompt(input: {
   ].join("\n");
 }
 
-function mergeCompressedItems(memories: MemoryApiRecord[], items: CompressedMemorySlot[]): MemoryApiRecord[] {
+function mergeCompressedById(
+  memories: MemoryApiRecord[],
+  pairs: CompressedPairMap
+): { data: MemoryApiRecord[]; fallback_slots: number } {
   const result: MemoryApiRecord[] = [];
+  let fallbackSlots = 0;
 
-  for (let index = 0; index < items.length && index < memories.length; index += 1) {
-    const memory = memories[index];
-    const item = items[index];
-    if (!memory || !item) continue;
-    result.push({
-      ...memory,
-      content: item.content
-    });
-  }
+  memories.forEach((memory, index) => {
+    const id = slotId(index);
+    if (!pairs.has(id)) {
+      // Slot missing/unpairable in model output: keep the original content —
+      // a longer prompt beats a swapped memory.
+      fallbackSlots += 1;
+      result.push({ ...memory });
+      return;
+    }
+    const content = pairs.get(id);
+    if (content === null || content === undefined) return;
+    result.push({ ...memory, content });
+  });
 
-  return result;
+  return { data: result, fallback_slots: fallbackSlots };
 }
 
 function describeModelOutput(value: unknown): string {
@@ -607,8 +621,9 @@ export async function filterAndCompressMemoriesWithMeta(
       return { data: [], meta: errorMeta };
     }
 
-    const items = parseCompressedItems(output);
-    if (!items) {
+    const validIds = new Set(reranked.data.map((_, index) => slotId(index)));
+    const pairs = parseCompressedPairs(output, validIds);
+    if (!pairs) {
       const errorMeta: MemoryFilterMeta = {
         ...activeMeta,
         status: "error",
@@ -623,22 +638,8 @@ export async function filterAndCompressMemoriesWithMeta(
       return { data: [], meta: errorMeta };
     }
 
-    if (items.length !== reranked.data.length) {
-      const errorMeta: MemoryFilterMeta = {
-        ...activeMeta,
-        status: "error",
-        reason: "slot_count_mismatch",
-        output_shape: describeModelOutput(output),
-        reranker_status: reranked.status,
-        reranker_model: reranked.model,
-        reranker_count: reranked.data.length,
-        ...(reranked.reason ? { reranker_reason: reranked.reason } : {})
-      };
-      if (failOpen) return buildFailOpenResult(reranked, maxOutput, errorMeta);
-      return { data: [], meta: errorMeta };
-    }
-
-    const filtered = mergeCompressedItems(reranked.data, items).slice(0, maxOutput);
+    const merged = mergeCompressedById(reranked.data, pairs);
+    const filtered = merged.data.slice(0, maxOutput);
     return {
       data: filtered,
       meta: {
@@ -649,6 +650,13 @@ export async function filterAndCompressMemoriesWithMeta(
         reranker_status: reranked.status,
         reranker_model: reranked.model,
         reranker_count: reranked.data.length,
+        ...(merged.fallback_slots > 0
+          ? {
+              fallback_used: true,
+              fallback_slots: merged.fallback_slots,
+              ...(merged.fallback_slots === reranked.data.length ? { reason: "unpairable_output" } : {})
+            }
+          : {}),
         ...(reranked.reason ? { reranker_reason: reranked.reason } : {})
       }
     };
