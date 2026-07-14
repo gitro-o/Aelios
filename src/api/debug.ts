@@ -12,9 +12,11 @@ import {
 } from "../memory/vectorStore";
 import { runVectorDoctor } from "../memory/vectorDoctor";
 import { listLongtail, upsertLongtailEmbedding } from "../db/v2";
+import { listMemoriesPage } from "../db/memories";
+import { upsertMemoryEmbedding } from "../memory/embedding";
 import { json, openAiError } from "../utils/json";
 import type { Env, KeyProfile, MemoryApiRecord } from "../types";
-import { readBoolean, readJsonObject, readPositiveInt, readString } from "../utils/request";
+import { readBoolean, readJsonObject, readNonNegativeInt, readPositiveInt, readString } from "../utils/request";
 
 interface CacheHealthRow {
   created_at: string;
@@ -325,6 +327,67 @@ export async function handleVectorReindex(request: Request, env: Env): Promise<R
         error: error instanceof Error ? error.message : String(error)
       }, { status: 500 });
     }
+  }
+
+  if (layer === "memories") {
+    // 以 D1 为源重算向量+重写完整 metadata。旧实现(vectorize_legacy)反向从
+    // Vectorize metadata 写回 D1，向量串线时会污染本体，只留作应急。
+    try {
+      const offset = readNonNegativeInt(body.offset, 0, 100000);
+      const page = await listMemoriesPage(env.DB, { namespace, status: "active", limit, offset });
+      const rewritten: Array<{ id: string; vector_id: string | null; ok: boolean; error?: string }> = [];
+
+      for (const record of page.records) {
+        if (dryRun) {
+          rewritten.push({ id: record.id, vector_id: record.vector_id, ok: true });
+          continue;
+        }
+        try {
+          const ok = await upsertMemoryEmbedding(env, record);
+          rewritten.push({
+            id: record.id,
+            vector_id: record.vector_id,
+            ok,
+            ...(ok ? {} : { error: "skipped: no vector_id or not active" })
+          });
+        } catch (error) {
+          rewritten.push({
+            id: record.id,
+            vector_id: record.vector_id,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+
+      const failed = rewritten.filter((item) => !item.ok);
+      return json({
+        ok: failed.length === 0,
+        data: {
+          namespace,
+          layer,
+          embedding_model: model,
+          dry_run: dryRun,
+          source: "d1",
+          offset,
+          matched: page.records.length,
+          rewritten_count: rewritten.length - failed.length,
+          failed_count: failed.length,
+          has_more: page.hasMore,
+          next_offset: page.hasMore ? page.nextOffset : null,
+          failed
+        }
+      }, { status: failed.length === 0 ? 200 : 500 });
+    } catch (error) {
+      return json({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error)
+      }, { status: 500 });
+    }
+  }
+
+  if (layer !== "vectorize_legacy") {
+    return openAiError(`Unknown layer: ${layer}`, 400);
   }
 
   try {
