@@ -11,6 +11,7 @@ import {
   vectorMetadataToMemoryRecord
 } from "../memory/vectorStore";
 import { runVectorDoctor } from "../memory/vectorDoctor";
+import { listLongtail, upsertLongtailEmbedding } from "../db/v2";
 import { json, openAiError } from "../utils/json";
 import type { Env, KeyProfile, MemoryApiRecord } from "../types";
 import { readBoolean, readJsonObject, readPositiveInt, readString } from "../utils/request";
@@ -187,7 +188,7 @@ export async function handleVectorHealth(request: Request, env: Env): Promise<Re
   let created: MemoryApiRecord | null = null;
 
   try {
-    const vector = await createEmbedding(env, phrase);
+    const vector = await createEmbedding(env, phrase, "query");
     if (!vector) {
       result.checks = { embedding: { ok: false, error: "embedding_returned_null" } };
       return json(result, { status: 503 });
@@ -286,6 +287,45 @@ export async function handleVectorReindex(request: Request, env: Env): Promise<R
   const cursor = readString(body.cursor);
   const dryRun = readBoolean(body.dry_run, true);
   const model = readEmbeddingModel(env);
+  const layer = readString(body.layer) || "memories";
+
+  if (layer === "longtail") {
+    try {
+      const rows = await listLongtail(env.DB, { namespace, limit: readPositiveInt(body.limit, 200, 200) });
+      const rewritten: Array<{ id: string; ok: boolean; error?: string }> = [];
+      for (const row of rows) {
+        if (dryRun) {
+          rewritten.push({ id: row.id, ok: true });
+          continue;
+        }
+        try {
+          await upsertLongtailEmbedding(env, { id: row.id, namespace: row.namespace, content: row.content });
+          rewritten.push({ id: row.id, ok: true });
+        } catch (error) {
+          rewritten.push({ id: row.id, ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      const failed = rewritten.filter((item) => !item.ok);
+      return json({
+        ok: failed.length === 0,
+        data: {
+          namespace,
+          layer,
+          embedding_model: model,
+          dry_run: dryRun,
+          matched: rows.length,
+          rewritten_count: rewritten.length - failed.length,
+          failed_count: failed.length,
+          failed
+        }
+      }, { status: failed.length === 0 ? 200 : 500 });
+    } catch (error) {
+      return json({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error)
+      }, { status: 500 });
+    }
+  }
 
   try {
     const page = await listVectorMemories(env, {

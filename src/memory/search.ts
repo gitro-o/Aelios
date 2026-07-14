@@ -234,7 +234,7 @@ async function searchWithVectorize(
 ): Promise<VectorizeSearchOutcome | null> {
   if (!env.VECTORIZE || !input.query.trim()) return null;
 
-  const vector = await createEmbedding(env, input.query);
+  const vector = await createEmbedding(env, input.query, "query");
   if (!vector) return null;
 
   const legacyFallbackLimit = getLegacyFallbackLimit(env, input.topK);

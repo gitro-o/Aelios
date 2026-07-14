@@ -541,7 +541,7 @@ export async function searchVectorMemories(
   const query = input.query.trim();
   if (!query) return [];
 
-  const vector = await createEmbedding(env, query);
+  const vector = await createEmbedding(env, query, "query");
   if (!vector) return [];
 
   const filter: VectorizeVectorMetadataFilter = {

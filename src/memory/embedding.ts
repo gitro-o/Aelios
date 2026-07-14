@@ -3,6 +3,19 @@ import { callOpenAICompatEmbeddings } from "../proxy/openaiAdapter";
 
 const DEFAULT_EMBEDDING_MODEL = "workers-ai/@cf/google/embeddinggemma-300m";
 
+export type EmbeddingKind = "query" | "document";
+
+// EmbeddingGemma 是非对称检索模型，官方要求按用途加 task 前缀：
+// query 侧和 document 侧的前缀不同，漏加会让短 query 对长文档的相似度塌掉
+// (2026-07-02 诊断：无前缀时 "泌尿科" 对长文相似度 <0.1，被最低分闸门整体滤空)。
+// https://ai.google.dev/gemma/docs/embeddinggemma — Prompt instructions
+function applyTaskPrefix(model: string, text: string, kind: EmbeddingKind): string {
+  if (!model.includes("embeddinggemma")) return text;
+  return kind === "query"
+    ? `task: search result | query: ${text}`
+    : `title: none | text: ${text}`;
+}
+
 function workersAiModelName(model: string): string | null {
   const normalized = model.trim();
   if (normalized.startsWith("workers-ai/")) return normalized.slice("workers-ai/".length);
@@ -47,13 +60,18 @@ function readEmbedding(result: unknown): number[] | null {
   return null;
 }
 
-export async function createEmbedding(env: Env, text: string): Promise<number[] | null> {
+export async function createEmbedding(
+  env: Env,
+  text: string,
+  kind: EmbeddingKind = "document"
+): Promise<number[] | null> {
   const model = env.EMBEDDING_MODEL || DEFAULT_EMBEDDING_MODEL;
+  const input = applyTaskPrefix(model, text, kind);
   const workersAiModel = workersAiModelName(model);
   if (workersAiModel) {
     if (!env.AI) return null;
     try {
-      const result = await env.AI.run(workersAiModel as any, { text: [text] });
+      const result = await env.AI.run(workersAiModel as any, { text: [input] });
       return readEmbedding(result);
     } catch (error) {
       console.error("memory embedding failed", error);
@@ -66,7 +84,7 @@ export async function createEmbedding(env: Env, text: string): Promise<number[] 
   try {
     response = await callOpenAICompatEmbeddings(env, {
       model,
-      input: text,
+      input,
       ...(dimensions ? { dimensions } : {})
     });
   } catch (error) {

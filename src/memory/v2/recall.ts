@@ -422,7 +422,7 @@ async function recallLongtailByVector(
   input: RecallInput
 ): Promise<RecallHit[]> {
   if (!env.VECTORIZE || !input.query.trim()) return [];
-  const vector = await createEmbedding(env, input.query);
+  const vector = await createEmbedding(env, input.query, "query");
   if (!vector) return [];
   try {
     const result = await env.VECTORIZE.query(vector, {
