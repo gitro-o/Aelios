@@ -336,6 +336,9 @@ export async function handleVectorReindex(request: Request, env: Env): Promise<R
     const rewritten: Array<{ id: string; vector_id: string | null; ok: boolean; error?: string }> = [];
 
     for (const memory of page.data) {
+      // longtail 向量 (lt_*) 会被 no-filter 枚举捞进来，但它们不在 memories 表里，
+      // updateVectorMemory 只会白白失败——longtail 重嵌走 layer:"longtail"
+      if (memory.vector_id?.startsWith("lt_")) continue;
       if (dryRun) {
         rewritten.push({ id: memory.id, vector_id: memory.vector_id, ok: true });
         continue;
