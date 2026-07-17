@@ -33,10 +33,14 @@ export interface Env {
   MEMORY_PATROL_DRY_RUN?: string;
   // 是否允许自动删（默认 false 锁死）
   MEMORY_AUTO_DELETE?: string;
-  // 闸三降权窗口 (分钟)，默认 30
+  // 闸三降权窗口 (分钟)，默认 240
   MEMORY_INJECT_DECAY_WINDOW_MIN?: string;
-  // 闸三降权系数 (0-1)，默认 0.5
+  // 闸三降权系数 (0-1)，默认 0.35
   MEMORY_INJECT_DECAY_FACTOR?: string;
+  // 过曝疲劳系数: 1/(1+alpha*log10(1+recall_count))，默认 0.15，0 = 关闭
+  MEMORY_FATIGUE_ALPHA?: string;
+  // /v1/memory/search 轮休重排后记账 last_injected_at 的头部条数，默认 10
+  MEMORY_SEARCH_MARK_TOP?: string;
   // memory_recall 最低分地板，默认 0.15；调用方可用 min_score 临时覆盖。
   RECALL_MIN_SCORE?: string;
   // true = 丢弃没有有效 D1 记录背书的 Vectorize 命中 (清理 legacy 孤儿向量)，默认 false 保持现状。

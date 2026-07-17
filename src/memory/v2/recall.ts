@@ -25,6 +25,13 @@ import type { MemoryApiRecordWithProvenance } from "../search";
 import { filterAndCompressMemories } from "../filter";
 import { createEmbedding } from "../embedding";
 import type { Env } from "../../types";
+import {
+  decayForLastInjected,
+  fatigueAlpha,
+  fatigueForRecallCount,
+  injectDecayFactor,
+  injectDecayWindowMs
+} from "../rotation";
 
 // --- 开关 ---
 
@@ -32,33 +39,9 @@ export function isV2Enabled(env: Env): boolean {
   return env.MEMORY_LIFECYCLE_ENABLED !== "false";
 }
 
-// 闸三: 近期注入过的降权系数。last_injected_at 在窗口内打折扣。
-// 窗口/系数做成 env 可配，不配走默认 (30 分钟 / 0.5)。
-function injectDecayWindowMs(env: Env): number {
-  const mins = Number(env.MEMORY_INJECT_DECAY_WINDOW_MIN);
-  return Number.isFinite(mins) && mins > 0 ? mins * 60 * 1000 : 30 * 60 * 1000;
-}
-function injectDecayFactor(env: Env): number {
-  const f = Number(env.MEMORY_INJECT_DECAY_FACTOR);
-  return Number.isFinite(f) && f > 0 && f < 1 ? f : 0.5;
-}
-
 function readRecallMinScore(env: Env, override?: number): number {
   const raw = override ?? Number(env.RECALL_MIN_SCORE ?? 0.15);
   return Number.isFinite(raw) ? Math.min(Math.max(raw, 0), 1) : 0.15;
-}
-
-function decayForLastInjected(
-  lastInjectedAt: string | null,
-  windowMs: number,
-  factor: number,
-  now = Date.now()
-): number {
-  if (!lastInjectedAt) return 1;
-  const ts = Date.parse(lastInjectedAt);
-  if (!Number.isFinite(ts)) return 1;
-  if (now - ts > windowMs) return 1;
-  return factor;
 }
 
 // =====================================================================
@@ -325,17 +308,20 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
   })) as MemoryApiRecordWithProvenance[];
 
   // 3. 闸三: last_injected_at 近期注入过的降权 (不动 importance)
+  //    外加过曝疲劳: recall_count 高的常客再乘一道 log 缓坡折扣, pinned 豁免。
   const windowMs = injectDecayWindowMs(env);
   const factor = injectDecayFactor(env);
+  const alpha = fatigueAlpha(env);
   const decayedIds: string[] = [];
   const scored: RecallHit[] = memories.map((m) => {
-    const decay = decayForLastInjected(m.last_injected_at ?? null, windowMs, factor);
+    const decay = m.pinned ? 1 : decayForLastInjected(m.last_injected_at ?? null, windowMs, factor);
+    const fatigue = m.pinned ? 1 : fatigueForRecallCount(m.recall_count, alpha);
     if (decay < 1) decayedIds.push(m.id);
     return {
       id: m.id,
       content: m.content,
       type: m.type,
-      score: (m.score ?? 0) * decay,
+      score: (m.score ?? 0) * decay * fatigue,
       source_layer: "memory" as const,
       source: m.source ?? null,
       backed: m.backed,

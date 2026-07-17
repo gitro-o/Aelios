@@ -27,6 +27,7 @@ import {
   listLongtail,
   listMemoryCandidates,
   listPrecious,
+  markMemoriesInjected,
   type MemoryCandidateRow,
   supersedeMemory,
   updateGlossary,
@@ -36,6 +37,13 @@ import {
   upsertMemoryByFactKey
 } from "../db/v2";
 import { isV2Enabled } from "../memory/v2/recall";
+import {
+  decayForLastInjected,
+  fatigueAlpha,
+  fatigueForRecallCount,
+  injectDecayFactor,
+  injectDecayWindowMs
+} from "../memory/rotation";
 import { enqueueMemoryMaintenanceIfNeeded } from "../queue/producer";
 import type { Env, KeyProfile } from "../types";
 import { json, openAiError } from "../utils/json";
@@ -203,7 +211,33 @@ async function handleSearchMemories(request: Request, env: Env, profile: KeyProf
   const filterResult = shouldFilter
     ? await filterAndCompressMemoriesWithMeta(env, { query, memories: raw })
     : null;
-  const data = filterResult ? filterResult.data : raw;
+  const preRotation = filterResult ? filterResult.data : raw;
+
+  // 轮休重排: 近期注入过的 (闸三 decay) × 常年霸座的 (过曝 fatigue) 一起降权,
+  // 让排序头部随对话轮转而不是永远同一批高分记忆。pinned 豁免。
+  const windowMs = injectDecayWindowMs(env);
+  const factor = injectDecayFactor(env);
+  const alpha = fatigueAlpha(env);
+  let decayedCount = 0;
+  const data = preRotation
+    .map((memory, index) => {
+      if (memory.pinned) return { memory, index, adjusted: memory.score ?? 0 };
+      const decay = decayForLastInjected(memory.last_injected_at ?? null, windowMs, factor);
+      const fatigue = fatigueForRecallCount(memory.recall_count, alpha);
+      if (decay < 1) decayedCount += 1;
+      return { memory, index, adjusted: (memory.score ?? 0) * decay * fatigue };
+    })
+    .sort((a, b) => b.adjusted - a.adjusted || a.index - b.index)
+    .map((entry) => entry.memory);
+
+  // 记账 last_injected_at: 调用方 (hook) 只消费头部几条, 按 mark_top 记头部,
+  // 下一轮同类 query 这些条目就进闸三窗口轮休。mark_injected=false 可跳过 (只读旁路)。
+  const shouldMark = readBoolean(body.mark_injected, true);
+  const markTop = readPositiveInt(body.mark_top, Number(env.MEMORY_SEARCH_MARK_TOP || 10), 50);
+  const markedIds = shouldMark ? data.slice(0, markTop).map((memory) => memory.id) : [];
+  if (markedIds.length > 0) {
+    await markMemoriesInjected(env.DB, { namespace, ids: markedIds });
+  }
 
   return json({
     data,
@@ -214,6 +248,13 @@ async function handleSearchMemories(request: Request, env: Env, profile: KeyProf
       raw_count: raw.length,
       count: data.length,
       filtered: shouldFilter,
+      rotation: {
+        decayed: decayedCount,
+        fatigue_alpha: alpha,
+        decay_window_min: windowMs / 60000,
+        decay_factor: factor,
+        marked: markedIds.length
+      },
       ...(readBoolean(body.include_filter_debug) && filterResult ? { memory_filter: filterResult.meta } : {})
     },
     ...(readBoolean(body.include_prompt) ? { prompt: formatMemoryPatch(data) } : {})

@@ -48,6 +48,13 @@ VISION_MODEL = "google-ai-studio/gemini-3-flash-preview"
 # handled by the reranker + compressor, so keep this as a garbage gate only.
 MEMORY_MIN_SCORE = "0.02"
 MEMORY_TOP_K = "50"
+# 记忆轮休 (search + v2 recall 共用, src/memory/rotation.ts):
+# 近期注入过的条目在窗口内打折, 高 recall_count 常客再乘疲劳折扣,
+# 防止同一批高分日记每轮召回都霸座。
+MEMORY_INJECT_DECAY_WINDOW_MIN = "240"
+MEMORY_INJECT_DECAY_FACTOR = "0.35"
+MEMORY_FATIGUE_ALPHA = "0.15"
+MEMORY_SEARCH_MARK_TOP = "10"
 MEMORY_RERANKER_MODEL = "workers-ai/@cf/baai/bge-reranker-base"
 VECTORIZE_INDEX_NAME = "memo-kb"
 EMBEDDING_MODEL = "workers-ai/@cf/google/embeddinggemma-300m"
