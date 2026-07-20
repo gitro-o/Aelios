@@ -474,6 +474,7 @@ export async function runMemoryExtractionWindow(
   options: { scheduledTime?: number; force?: boolean } = {}
 ): Promise<MemoryExtractionRunResult> {
   if (!isV2Enabled(env)) return { ran: false, mode: "extract", reason: "extract_disabled" };
+  if (env.ENABLE_EXTRACT === "false") return { ran: false, mode: "extract", reason: "extract_disabled" };
 
   const endIso = windowEndIso(options.scheduledTime);
   const cursorName = `extract:${namespace}`;

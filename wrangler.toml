@@ -41,6 +41,7 @@ MEMORY_FILTER_MAX_TOKENS = "1400"
 # The reranker (bge-reranker-base) + LLM compressor own precision downstream.
 MEMORY_FILTER_MIN_SCORE = "0.02"
 DREAM_MODEL = "deepseek/deepseek-v4-pro"
+ENABLE_EXTRACT = "false"
 EXTRACT_MODEL = "deepseek/deepseek-v4-flash"
 DEDUP_COSINE = "0.9"
 VISION_MODEL = "google-ai-studio/gemini-3-flash-preview"
