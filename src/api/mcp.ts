@@ -289,6 +289,7 @@ function getTools(): Array<Record<string, unknown>> {
         properties: {
           fact_key: { type: "string" },
           content: { type: "string" },
+          summary: { type: "string", description: "One-line summary for quick scanning" },
           type: { type: "string" },
           importance: { type: "number" },
           confidence: { type: "number" },
@@ -312,6 +313,10 @@ function getTools(): Array<Record<string, unknown>> {
           new_content: { type: "string" },
           new_type: { type: "string" },
           new_fact_key: { type: "string" },
+          importance: { type: "number" },
+          confidence: { type: "number" },
+          tags: { type: "array", items: { type: "string" } },
+          source: { type: "string" },
           valid_as_of: { type: "string" },
           reason: { type: "string" },
           namespace: { type: "string" }
@@ -635,6 +640,7 @@ async function callTool(
       namespace: resolveNamespace(profile, args.namespace),
       factKey,
       content,
+      summary: readString(args.summary) || null,
       type: readString(args.type) || "fact",
       importance: readNumber(args.importance, 0.6),
       confidence: readNumber(args.confidence, 0.8),
@@ -659,6 +665,10 @@ async function callTool(
         newContent,
         newType: readString(args.new_type) || "world_fact",
         newFactKey: readString(args.new_fact_key),
+        importance: readNumber(args.importance, 0.6),
+        confidence: readNumber(args.confidence, 0.8),
+        tags: readStringArray(args.tags),
+        source: readString(args.source),
         validAsOf: readString(args.valid_as_of),
         reason: readString(args.reason)
       });

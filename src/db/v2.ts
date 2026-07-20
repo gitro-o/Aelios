@@ -730,7 +730,7 @@ export async function fetchMemoryLifecycleRows(
 // 同时写 D1 (本体) 和 Vectorize (检索镜像)，设 vector_id，否则 recall 召不到。
 export async function upsertMemoryByFactKey(
   env: Env,
-  input: { namespace: string; factKey: string; content: string; type?: string; importance?: number; confidence?: number; tags?: string[]; source?: string | null; sourceMessageIds?: string[]; validAsOf?: string | null }
+  input: { namespace: string; factKey: string; content: string; summary?: string | null; type?: string; importance?: number; confidence?: number; tags?: string[]; source?: string | null; sourceMessageIds?: string[]; validAsOf?: string | null }
 ): Promise<{ id: string; created: boolean }> {
   const db = env.DB;
   const now = nowIso();
@@ -749,12 +749,13 @@ export async function upsertMemoryByFactKey(
     // 更新 memories 本体 (v1 列)
     await db
       .prepare(
-        `UPDATE memories SET content = ?, type = ?, importance = ?, confidence = ?,
+        `UPDATE memories SET content = ?, summary = ?, type = ?, importance = ?, confidence = ?,
           tags = ?, source = ?, source_message_ids = ?, updated_at = ?
          WHERE id = ?`
       )
       .bind(
         input.content,
+        input.summary ?? null,
         clampMemoryType(input.type, "fact"),
         input.importance ?? 0.6,
         input.confidence ?? 0.8,
@@ -783,15 +784,16 @@ export async function upsertMemoryByFactKey(
   await db
     .prepare(
       `INSERT INTO memories (
-        id, namespace, type, content, importance, confidence, status, pinned,
+        id, namespace, type, content, summary, importance, confidence, status, pinned,
         tags, source, source_message_ids, vector_id, created_at, updated_at, expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, null)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, null)`
     )
     .bind(
       id,
       input.namespace,
       clampMemoryType(input.type, "fact"),
       input.content,
+      input.summary ?? null,
       input.importance ?? 0.6,
       input.confidence ?? 0.8,
       JSON.stringify(input.tags ?? []),
