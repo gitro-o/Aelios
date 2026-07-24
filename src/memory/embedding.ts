@@ -71,9 +71,11 @@ export async function createEmbedding(
   if (workersAiModel) {
     if (!env.AI) return null;
     try {
-      // workersAiModel is parsed at runtime from EMBEDDING_MODEL; keyof AiModels is the narrowest safe cast.
       const result = await env.AI.run(workersAiModel as keyof AiModels, { text: [input] });
-      return readEmbedding(result);
+      const vec = readEmbedding(result);
+      const dims = readEmbeddingDimensions(env);
+      if (vec && dims && vec.length > dims) return vec.slice(0, dims);
+      return vec;
     } catch (error) {
       console.error("memory embedding failed", error);
       return null;
