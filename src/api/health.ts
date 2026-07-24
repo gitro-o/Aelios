@@ -8,7 +8,6 @@ const requiredTextVars = [
   "CLOUDFLARE_ACCOUNT_ID",
   "CLOUDFLARE_API_TOKEN",
   "CHAT_MODEL",
-  "MEMORY_FILTER_MODEL",
   "VISION_MODEL"
 ] as const;
 
@@ -24,9 +23,7 @@ const optionalBindings = [
 
 export function handleHealth(env: Env): Response {
   const missing_text_vars: string[] = requiredTextVars.filter((name) => !env[name]);
-  if (!env.DREAM_MODEL && !env.SUMMARY_MODEL && !env.DAILY_DIGEST_MODEL) {
-    missing_text_vars.push("DREAM_MODEL");
-  }
+
   const missing_bindings = requiredBindings
     .filter(([, binding]) => !env[binding])
     .map(([name]) => name);
@@ -35,17 +32,20 @@ export function handleHealth(env: Env): Response {
     .map(([name]) => name);
   const ok = missing_text_vars.length === 0 && missing_bindings.length === 0;
 
-  return json({
-    ok,
-    status: ok ? (missing_optional_bindings.length === 0 ? "ok" : "degraded") : "missing_configuration",
-    service: "companion-memory-proxy",
-    missing_text_vars,
-    missing_bindings,
-    missing_optional_bindings,
-    bindings: {
-      d1: Boolean(env.DB),
-      vectorize: Boolean(env.VECTORIZE),
-      queue: Boolean(env.MEMORY_QUEUE)
-    }
-  });
+  return json(
+    {
+      ok,
+      status: ok ? (missing_optional_bindings.length === 0 ? "ok" : "degraded") : "missing_configuration",
+      service: "companion-memory-proxy",
+      missing_text_vars,
+      missing_bindings,
+      missing_optional_bindings,
+      bindings: {
+        d1: Boolean(env.DB),
+        vectorize: Boolean(env.VECTORIZE),
+        queue: Boolean(env.MEMORY_QUEUE)
+      }
+    },
+    { headers: { "Cache-Control": "public, max-age=30" } }
+  );
 }

@@ -6,6 +6,7 @@
 
 import { getMessagesByIds } from "../db/messages";
 import {
+  archiveMemory,
   getActiveMemoryByFactKey,
   listMemoryCandidates,
   supersedeMemory,
@@ -13,8 +14,9 @@ import {
   upsertMemoryByFactKey,
   type MemoryCandidateRow
 } from "../db/v2";
-import { callOpenAICompat } from "../proxy/openaiAdapter";
-import type { Env, MessageRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
+import { callModelWithRetry, readModelName } from "../utils/modelCall";
+import type { Env, MessageRecord } from "../types";
+import { extractJsonObject } from "../utils/parse";
 import { createVectorMemory } from "./vectorStore";
 
 // listMemoryCandidates 本身按 confidence ASC 排序，正好是"先看最没把握的"，直接复用，
@@ -67,23 +69,6 @@ function parseJsonArray(raw: string | null): string[] {
   return [];
 }
 
-// 和 extractPipeline.ts 的 extractJsonObject 同样的容错解析：模型偶尔会在 JSON 外面裹一层文字。
-function extractJsonObject(text: string): unknown | null {
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    // fallthrough to brace-scan
-  }
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) return null;
-  try {
-    return JSON.parse(text.slice(start, end + 1)) as unknown;
-  } catch {
-    return null;
-  }
-}
-
 function formatTranscript(messages: MessageRecord[]): string {
   return messages
     .map((message) => {
@@ -104,6 +89,8 @@ function buildJudgePrompt(candidate: MemoryCandidateRow, messages: MessageRecord
     "- grounded (是否有据)：候选内容必须能在下面的原始对话片段里找到依据，不能是编造或过度引申；找不到依据必须 grounded=false。",
     "- durable (是否长期稳定)：这条记忆一个月后是否还成立；临时计划、一次性情绪、当次任务不算稳定事实。",
     "- non-trivial (是否值得占用长期记忆位)：不是可重新推导的寒暄，不是后端实现细节，不是纯调试噪音。",
+    "- 工程实现流水（文件路径、命令、debug 过程、部署配置、后端实现细节）即使 grounded 也压低分——这类内容有代码仓库和 git 史，不该占长期记忆位。",
+    "- 情感/关系类候选不因为内容长而扣分；带「」原话、写了 3-5 句的关系记忆是合格形态，不是啰嗦。",
     "证据越扎实、越稳定、越非平凡，score 越高；grounded / durable 必须是布尔值；reason 是一句话说明理由。",
     "",
     "输出格式：",
@@ -122,27 +109,25 @@ function buildJudgePrompt(candidate: MemoryCandidateRow, messages: MessageRecord
   ].join("\n");
 }
 
-async function callJudgeModel(env: Env, model: string, prompt: string): Promise<JudgeModelResult | null> {
-  const request: OpenAIChatRequest = {
-    model,
-    messages: [
-      { role: "system", content: "你是严格的 JSON 生成器。你只输出 JSON。" },
-      { role: "user", content: prompt }
-    ],
-    temperature: 0,
-    max_tokens: JUDGE_MAX_TOKENS,
-    response_format: { type: "json_object" },
-    stream: false
-  };
+async function callJudgeModel(env: Env, model: string, prompt: string, meta: { id: string }): Promise<JudgeModelResult | null> {
+  // backoffMs: [] preserves prior single-attempt behavior (no retry loop here before).
+  // systemPrompt preserves this caller's original (shorter) JSON-generator prompt.
+  let text: string;
+  try {
+    text = await callModelWithRetry(env, {
+      model,
+      prompt,
+      maxTokens: JUDGE_MAX_TOKENS,
+      backoffMs: [],
+      systemPrompt: "你是严格的 JSON 生成器。你只输出 JSON。",
+      logPrefix: "candidate_judge",
+      logMeta: { id: meta.id }
+    });
+  } catch {
+    return null;
+  }
 
-  const response = await callOpenAICompat(env, request);
-  if (!response.ok) return null;
-
-  const parsed = (await response.json()) as OpenAIChatResponse;
-  const message = parsed.choices?.[0]?.message as ({ content?: unknown; reasoning_content?: unknown }) | undefined;
-  const content = typeof message?.content === "string" ? message.content.trim() : "";
-  const reasoning = typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
-  const raw = extractJsonObject(content || reasoning);
+  const raw = extractJsonObject(text);
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
 
   const obj = raw as Record<string, unknown>;
@@ -157,7 +142,7 @@ async function callJudgeModel(env: Env, model: string, prompt: string): Promise<
   };
 }
 
-// approve 的落库语义跟 extractPipeline.persistCandidate 的 fact_key 分支一致：
+// approve 的落库语义跟 dream 候选队列的 fact_key 分支一致：
 // 有 fact_key 先查是否已有 active 同 key 记忆，有就 supersede (保留历史链)，没有就 upsert 新建；
 // 没有 fact_key 就走向量库直接建条目。admin 后台 /v1/candidates/:id/approve 的私有
 // createApprovedMemoryFromCandidate 目前是"有 fact_key 就直接 upsertMemoryByFactKey"，
@@ -170,6 +155,12 @@ async function approveCandidate(
   tags: string[],
   sourceMessageIds: string[]
 ): Promise<string> {
+  if (candidate.source === "dream_delete" && candidate.target_memory_id) {
+    const archived = await archiveMemory(env, { namespace, id: candidate.target_memory_id });
+    if (!archived) throw new Error("target memory not found");
+    return candidate.target_memory_id;
+  }
+
   const factKey = candidate.fact_key?.trim() || null;
 
   if (factKey) {
@@ -227,7 +218,7 @@ export async function runCandidateJudge(
     return { ran: false, judged: 0, approved: 0, discarded: 0, kept: 0, failed: 0, reason: "judge_disabled" };
   }
 
-  const model = env.JUDGE_MODEL?.trim() || env.EXTRACT_MODEL?.trim() || "";
+  const model = readModelName(env, ["JUDGE_MODEL", "DREAM_MODEL"], "");
   if (!model) {
     return { ran: false, judged: 0, approved: 0, discarded: 0, kept: 0, failed: 0, reason: "missing_model" };
   }
@@ -266,7 +257,7 @@ export async function runCandidateJudge(
         // 找不到任何原始消息可核对：直接判 ungrounded，不必浪费一次模型调用。
         judgeResult = { score: 0, grounded: false, durable: false, reason: "没有可核对的原始消息，无法确认是否有据" };
       } else {
-        const modelResult = await callJudgeModel(env, model, buildJudgePrompt(candidate, messages));
+        const modelResult = await callJudgeModel(env, model, buildJudgePrompt(candidate, messages), { id: candidate.id });
         if (!modelResult) {
           failed += 1;
           console.error("candidate judge: model call failed or returned invalid JSON", { namespace, id: candidate.id });

@@ -3,17 +3,28 @@ import { requireScope } from "../auth/scopes";
 import { getOrCreateConversation } from "../db/conversations";
 import { saveAssistantMessage, saveUserMessages } from "../db/messages";
 import { saveUsageLog } from "../db/usageLogs";
-import { extractLastUserText } from "../memory/inject";
-import { assemble } from "../assembler/assemble";
-import { enqueueMemoryMaintenanceIfNeeded, enqueueRetentionIfNeeded } from "../queue/producer";
-import { buildBootPackage, isV2Enabled, runRecall } from "../memory/v2/recall";
 import {
+  extractLastUserText,
+  formatMemoryPatch,
+  injectMemoryPatchBeforeCurrentUser,
+} from "../memory/inject";
+import { searchMemories } from "../memory/search";
+import { assemble } from "../assembler/assemble";
+import { enqueueRetentionIfNeeded } from "../queue/producer";
+import { listPrecious, markPreciousInjected } from "../db/v2";
+import { buildBootPackage, buildCoreFingerprint, isV2Enabled, runRecall } from "../memory/v2/recall";
+import {
+  buildAnthropicNativeRequest,
   buildAnthropicRequestFromAssembled,
   callAnthropicNative,
   getAnthropicCacheMode,
   parseAnthropicNonStream
 } from "../proxy/anthropicAdapter";
-import { buildOpenAIRequestFromAssembled, callOpenAICompat } from "../proxy/openaiAdapter";
+import {
+  buildOpenAICompatRequest,
+  buildOpenAIRequestFromAssembled,
+  callOpenAICompat,
+} from "../proxy/openaiAdapter";
 import { classifyProvider, resolveTargetModel } from "../proxy/resolveModel";
 import { streamAnthropicToOpenAI } from "../proxy/streamAnthropic";
 import { streamOpenAIWithTee } from "../proxy/streamOpenAI";
@@ -45,6 +56,47 @@ export function hasTools(body: OpenAIChatRequest): boolean {
 /** Determine whether this request needs the tool-call passthrough path. */
 export function hasToolRound(body: OpenAIChatRequest): boolean {
   return hasTools(body) || hasToolContent(body);
+}
+
+function recallHitToMemoryRecord(
+  h: {
+    id: string;
+    type: string;
+    content: string;
+    score: number;
+    source_layer: string;
+  },
+  namespace: string
+) {
+  return {
+    id: h.id,
+    namespace,
+    type: h.type,
+    content: h.content,
+    summary: null,
+    importance: h.score,
+    confidence: 1,
+    status: "active",
+    pinned: false,
+    tags: [] as string[],
+    source: h.source_layer,
+    source_message_ids: [] as string[],
+    vector_id: null,
+    last_recalled_at: null,
+    recall_count: 0,
+    created_at: "",
+    updated_at: "",
+    expires_at: null,
+    fact_key: null,
+    supersedes_id: null,
+    superseded_by_id: null,
+    review_reason: null,
+    valid_as_of: null,
+    last_seen_at: null,
+    seen_count: 0,
+    last_injected_at: null,
+    score: h.score,
+  };
 }
 
 export async function handleChatCompletions(
@@ -84,67 +136,102 @@ export async function handleChatCompletions(
 
   const provider = classifyProvider(targetModel);
 
-  const conversation = await getOrCreateConversation(env.DB, {
-    namespace: auth.profile.namespace
-  });
-
-  const savedUserMessageIds = await saveUserMessages(env.DB, {
-    conversationId: conversation.id,
-    namespace: auth.profile.namespace,
-    source: auth.profile.source,
-    messages: body.messages,
-    requestModel: body.model,
-    upstreamModel: targetModel,
-    upstreamProvider: provider,
-    stream: Boolean(body.stream)
-  });
-  const latestUserMessageId = savedUserMessageIds[savedUserMessageIds.length - 1];
-
   const namespace = auth.profile.namespace;
   const lastUserText = extractLastUserText(body.messages);
 
-  const boot = isV2Enabled(env) ? await buildBootPackage(env, { namespace }) : null;
-  const recallResult = boot ? await runRecall(env, { namespace, query: lastUserText }) : null;
-  const recallHitsAsMemories = recallResult
-    ? recallResult.hits.map((h) => ({
-        id: h.id,
+  // Two independent pre-upstream chains under one Promise.all:
+  // A: conversation + save user messages (serial inside chain — save needs conversation.id)
+  // B: precious → fingerprint → Promise.all(boot, recall) when v2 is enabled
+  const [chainA, chainB] = await Promise.all([
+    (async () => {
+      const conversation = await getOrCreateConversation(env.DB, { namespace });
+      const savedUserMessageIds = await saveUserMessages(env.DB, {
+        conversationId: conversation.id,
         namespace,
-        type: h.type,
-        content: h.content,
-        summary: null,
-        importance: h.score,
-        confidence: 1,
-        status: "active",
-        pinned: false,
-        tags: [],
-        source: h.source_layer,
-        source_message_ids: [],
-        vector_id: null,
-        last_recalled_at: null,
-        recall_count: 0,
-        created_at: "",
-        updated_at: "",
-        expires_at: null,
-        fact_key: null,
-        supersedes_id: null,
-        superseded_by_id: null,
-        review_reason: null,
-        valid_as_of: null,
-        last_seen_at: null,
-        seen_count: 0,
-        last_injected_at: null,
-        score: h.score,
-      }))
+        source: auth.profile.source,
+        messages: body.messages,
+        requestModel: body.model,
+        upstreamModel: targetModel,
+        upstreamProvider: provider,
+        stream: Boolean(body.stream)
+      });
+      return { conversation, savedUserMessageIds };
+    })(),
+    (async () => {
+      if (!isV2Enabled(env)) {
+        return {
+          boot: null as Awaited<ReturnType<typeof buildBootPackage>> | null,
+          recallResult: null as Awaited<ReturnType<typeof runRecall>> | null
+        };
+      }
+      const preciousRows = await listPrecious(env.DB, { namespace, limit: 50 });
+      const coreFingerprint = buildCoreFingerprint(preciousRows.map((r) => r.content));
+      const [boot, recallResult] = await Promise.all([
+        buildBootPackage(env, { namespace, preciousRows }),
+        runRecall(env, {
+          namespace,
+          query: lastUserText,
+          core_fingerprint: coreFingerprint,
+          waitUntil: ctx.waitUntil.bind(ctx)
+        })
+      ]);
+      return { boot, recallResult };
+    })()
+  ]);
+
+  const { conversation, savedUserMessageIds } = chainA;
+  const latestUserMessageId = savedUserMessageIds[savedUserMessageIds.length - 1];
+  const boot = chainB.boot;
+  const recallResult = chainB.recallResult;
+
+  // Precious injection accounting: off response path (was inside buildBootPackage).
+  if (boot && boot.precious.length > 0) {
+    ctx.waitUntil(
+      markPreciousInjected(env.DB, {
+        namespace,
+        ids: boot.precious.map((p) => p.id)
+      })
+    );
+  }
+
+  const recallHitsAsMemories = recallResult
+    ? recallResult.hits.map((h) => recallHitToMemoryRecord(h, namespace))
     : [];
 
   let upstream: Response;
   let clientSystemHash: string | null = null;
   let cacheAnchorBlock: string | null = null;
   try {
-    if (provider === "anthropic") {
-      // Always use assembler path — it handles tools, tool_calls, tool_results,
-      // and the 4-breakpoint cache strategy. The old native path is only needed
-      // for edge cases where the assembler can't handle the request.
+    if (!isV2Enabled(env)) {
+      const ragMemories = lastUserText
+        ? await searchMemories(env, {
+            namespace,
+            query: lastUserText,
+            waitUntil: ctx.waitUntil.bind(ctx)
+          })
+        : [];
+      const memoryPatch = formatMemoryPatch(ragMemories);
+      const patchedBody: OpenAIChatRequest = {
+        ...body,
+        messages: injectMemoryPatchBeforeCurrentUser(body.messages, memoryPatch),
+      };
+
+      if (provider === "anthropic") {
+        upstream = await callAnthropicNative(
+          env,
+          await buildAnthropicNativeRequest(patchedBody, {
+            env,
+            targetModel,
+            namespace,
+            boot: null,
+            recallHits: [],
+          }),
+          targetModel
+        );
+      } else {
+        upstream = await callOpenAICompat(env, buildOpenAICompatRequest(patchedBody, targetModel));
+      }
+    } else if (provider === "anthropic") {
       const assembled = assemble({
         request: body,
         pinnedPersonaMemories: null,
@@ -153,10 +240,13 @@ export async function handleChatCompletions(
         visionOutput: null,
       });
       clientSystemHash = assembled.meta.client_system_hash;
-      cacheAnchorBlock = assembled.meta.anchor_index >= 0 ? "client_system" : null;
-      upstream = await callAnthropicNative(env, buildAnthropicRequestFromAssembled(body, targetModel, assembled, env), targetModel);
+      cacheAnchorBlock = assembled.meta.anchor_index >= 0 ? "persona_pinned" : null;
+      upstream = await callAnthropicNative(
+        env,
+        buildAnthropicRequestFromAssembled(body, targetModel, assembled, env),
+        targetModel
+      );
     } else {
-      // OpenAI-compatible: always use assembler path
       const assembled = assemble({
         request: body,
         pinnedPersonaMemories: null,
@@ -165,7 +255,10 @@ export async function handleChatCompletions(
         visionOutput: null,
       });
       clientSystemHash = assembled.meta.client_system_hash;
-      upstream = await callOpenAICompat(env, buildOpenAIRequestFromAssembled(body, targetModel, assembled));
+      upstream = await callOpenAICompat(
+        env,
+        buildOpenAIRequestFromAssembled(body, targetModel, assembled)
+      );
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed to call upstream";
@@ -257,13 +350,6 @@ export async function handleChatCompletions(
           clientSystemHash,
           cacheAnchorBlock
         }),
-        enqueueMemoryMaintenanceIfNeeded(env, {
-          namespace: auth.profile.namespace,
-          conversationId: conversation.id,
-          fromMessageId: latestUserMessageId,
-          toMessageId: assistantMessageId,
-          source: auth.profile.source
-        }),
         enqueueRetentionIfNeeded(env, auth.profile.namespace)
       ])
     );
@@ -312,13 +398,6 @@ export async function handleChatCompletions(
         usage: parsed.usage,
         clientSystemHash,
         cacheAnchorBlock
-      }),
-      enqueueMemoryMaintenanceIfNeeded(env, {
-        namespace: auth.profile.namespace,
-        conversationId: conversation.id,
-        fromMessageId: latestUserMessageId,
-        toMessageId: assistantMessageId,
-        source: auth.profile.source
       }),
       enqueueRetentionIfNeeded(env, auth.profile.namespace)
     ])

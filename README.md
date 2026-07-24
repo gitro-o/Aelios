@@ -7,6 +7,22 @@
 - 我是人类，想部署使用 → 看 [人类版](#人类版)
 - 我是 AI 助手，想维护调试 → 看 [AI 版](#ai版维护交接)
 
+## 分支指路
+
+- **main**：唯一主线，作者线上跑的就是这套（v2 记忆系统：六层分层、三档写入、v4 assembler 缓存、boot 包 + 召回三闸）。AGPL-3.0。
+- **memory-v2 分支已退役**：内容已全部并入 main，不再更新，历史留档。老用户如果 Cloudflare 构建还指着 memory-v2，把 Production branch 切回 main 即可，数据不用迁。
+- **tg-bot**：Telegram bot 集成分支（TWIN-WORKER：部署独立 worker `aelios-tgbot`，共享同一 D1/Vectorize），叠在主线上。部署方式点这里：[docs/telegram-bot.md（tg-bot 分支）](https://github.com/wusaki0723/Aelios/blob/tg-bot/docs/telegram-bot.md)。
+
+## 想用 v1 最终版？
+
+```bash
+git clone https://github.com/wusaki0723/Aelios
+cd Aelios
+git checkout v1-final
+```
+
+v1-final 是 v1 稳定版的最终封存点，之后不再维护；注意 v1-final 里的许可证仍是 MIT（换证不溯及已发布的版本），想要轻量老版的用户可以继续按 MIT 使用，文档以该 tag 内的 README 为准。
+
 ---
 
 # 人类版
@@ -18,7 +34,7 @@ Aelios 是一个跑在 Cloudflare 上的记忆服务。你的 AI 客户端（Cha
 ## 它替你解决了什么
 
 - 每次开新窗口 AI 就失忆 → 它把聊天存下来，自动整理成长期记忆，下次自动召回。
-- 记忆太多把 AI 搞蠢 → 它先粗筛、再精排、再压缩，最后只塞几百字进上下文。
+- 记忆太多把 AI 搞蠢 → 它先粗筛、再精排，原文直出进上下文。
 - 换个客户端记忆就没了 → 记忆存在你自己的 Cloudflare 里，换客户端只改一个地址。
 - 想给 Claude Code / Codex 加记忆 → 它能当成 MCP 工具挂上去，跨设备随身。
 
@@ -36,6 +52,8 @@ Aelios 是一个跑在 Cloudflare 上的记忆服务。你的 AI 客户端（Cha
    - **Deploy command:** `npm run deploy:cloudflare`
 
 > ⚠️ 必须是 `npm run deploy:cloudflare`，**不是** `npm run deploy`，**不是** `wrangler deploy`。这条命令会自动建好 D1 数据库 + Vectorize 向量库 + Queue 队列。用错命令数据库不会建。
+
+不配任何模型 key、不配 AI Gateway，记忆召回和夜间 dream 也能跑（Workers AI 默认链路）。
 
 ### 2. 设一把钥匙
 
@@ -73,8 +91,8 @@ https://<你的 Worker 地址>/admin
 
 | 标签 | 干什么 |
 |---|---|
-| **今日** | 今天聊了什么、L1 摘要、昨日日志、今日消息、记忆类型统计，一眼看完 |
-| **审核队列** | AI 每 4 小时自动抽出来的低置信度记忆会到这里，你点**通过 / 丢弃 / 合并 / 取代**，不让垃圾记忆污染记忆库 |
+| **今日** | 今天聊了什么、昨日日志、今日消息、记忆类型统计，一眼看完 |
+| **审核队列** | dream 夜间整理和抽取的稳定事实会到这里，你点**通过 / 丢弃 / 合并 / 取代**，不让垃圾记忆污染记忆库 |
 | **重要记忆** | 所有长期记忆，按类型分页浏览、搜索、编辑、删除 |
 | **更多** | 珍贵记忆（只增不删的原文）、黑话表（术语别名）、世界知识、维护工具 |
 | **设置** | 主题、地址、密钥 |
@@ -127,25 +145,17 @@ Hook 只需要你的 Aelios Worker 地址和 `CHATBOX_API_KEY`，不需要任何
 
 导盲犬只转述图片，不写记忆、不存聊天。
 
-## ⚠️ 注意 Workers AI 免费额度会被记忆压缩烧光
+## 零配置也能用
 
-记忆召回链路里有个 **LLM 压缩模型**（默认 `llama-3.3-70b`，跑在 Cloudflare Workers AI 上）。每轮聊天只要召回到记忆，它就会把候选记忆压缩一遍——这是整条链路里调得最勤、最吃 token 的地方。
+默认链路不需要 AI Gateway、不需要第三方模型 key：embedding + reranker + dream（每天一次）都跑 Workers AI。部署时填好 `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN`、`CHATBOX_API_KEY` 就能记、能召、能夜间整理。
 
-Cloudflare Workers AI 免费额度有限，**压缩模型是消耗大头**。额度一旦被它烧光，虽然 reranker 和 embedding 用量极小、本来根本花不完，但它们也跑在 Workers AI 上，会被一起连坐断供，整个记忆召回就哑火：记不进、也召不出。
-
-用量小（每天几十轮聊天）没事，默认配置够用。**用量大只需换掉压缩模型一个**，把它指到你的 AI Gateway 走付费 key，不占 Workers AI 免费额度：
-
-| 变量 | 换成什么 |
-|---|---|
-| `MEMORY_FILTER_MODEL` | 走 AI Gateway 的便宜 LLM（如 `deepseek/deepseek-v4-flash`） |
-
-reranker 和 embedding 用量很小，留在 Workers AI 上就行，不用换。真要换 `EMBEDDING_MODEL` 注意维度会变（旧向量不兼容，需重建 Vectorize 索引，面板「更多 → 维护」里有工具）。
+Workers AI 免费额度主要花在每日一次的 dream（默认 `gpt-oss-120b`）和偶尔的 reranker/embedding 上——**不再有每轮聊天的压缩模型**，额度压力小很多。真要换 `EMBEDDING_MODEL` 注意维度会变（需重建 Vectorize 索引，面板「更多 → 维护」里有工具）。
 
 ## 最容易踩的坑
 
 - 部署命令必须是 `npm run deploy:cloudflare`，别的会覆盖变量、不建库。
 - 重新部署变量不会丢（命令带 `--keep-vars`）。
-- Vectorize 索引 `memo-kb`（768 维 cosine）别手动删。
+- Vectorize 索引 `memo-kb`（1024 维 cosine）别手动删。
 - 看图会切到 `VISION_MODEL`，留意它的价格。
 
 到这儿就够了，剩下的交给 AI。
@@ -166,10 +176,10 @@ Cloudflare Workers 上的 OpenAI-compatible Memory Proxy。帮用户部署时：
 |---|---|
 | Worker | `companion-memory-proxy` |
 | D1 | `companion_memory_proxy` |
-| Vectorize | `memo-kb`（768 维 cosine） |
+| Vectorize | `memo-kb`（1024 维 cosine） |
 | Queue | `companion-memory` |
-| Embedding | `workers-ai/@cf/google/embeddinggemma-300m` |
-| Dimensions | 768（覆盖 `EMBEDDING_MODEL` 时输出维度需匹配） |
+| Embedding | `workers-ai/@cf/baai/bge-m3` |
+| Dimensions | 1024（覆盖 `EMBEDDING_MODEL` 时输出维度需匹配） |
 
 记忆库默认走 **v2**（`MEMORY_LIFECYCLE_ENABLED` 隐式开启）：D1 是本体，Vectorize 是镜像。兼容/回退开关默认隐藏。
 
@@ -200,7 +210,7 @@ workers-ai/@cf/...         → env.AI.run（不走 AI Gateway）
 
 **OpenRouter + Claude 路由约束**：OpenRouter 调 Claude 必须在 AI Gateway 里以 **custom-provider** 方式加 key，不能走官方 provider 路径。官方路径按 Anthropic 原生格式发请求，与 OpenRouter 的 OpenAI 兼容格式冲突，会破坏缓存和格式。模型名走 `custom-provider/claude-*` → Provider native 分支。
 
-**Workers AI 额度风险**：召回链路里的压缩模型（`MEMORY_FILTER_MODEL`，默认 `llama-3.3-70b`）、reranker（`MEMORY_RERANKER_MODEL`）、embedding（`EMBEDDING_MODEL`）默认都跑在 Workers AI 上，共享同一份免费额度。**压缩模型每轮召回都调、是消耗大头**；reranker 和 embedding 用量极小，本来花不完，但额度被压缩模型烧光后会被一起连坐断供，导致记不进、召不出。用量大时只需把 `MEMORY_FILTER_MODEL` 指到 AI Gateway 走付费 key；reranker / embedding 留 Workers AI 即可。换 `EMBEDDING_MODEL` 会改维度，需重建 Vectorize 索引。
+**Workers AI 额度**：v3 召回链路只有 embedding + reranker（每轮，用量小）+ dream（每日一次，默认 `gpt-oss-120b`），共享 Workers AI 免费额度。不再有 per-turn 压缩模型。换 `EMBEDDING_MODEL` 会改维度，需重建 Vectorize 索引。
 
 ## REST 端点
 
@@ -214,13 +224,16 @@ workers-ai/@cf/...         → env.AI.run（不走 AI Gateway）
 | GET / POST | `/mcp` `/memory-mcp` | MCP 端点 |
 | GET / POST | `/v1/memories` `/v1/memory` | 记忆列表 / 新建（v2 必须带 `fact_key`，走 upsert） |
 | GET / PATCH / DELETE | `/v1/memories/:id` `/v1/memory/:id` | 单条记忆操作 |
-| POST | `/v1/search/memories` | 记忆搜索（召回用，可被压缩加工；`filter:false` 跳 reranker，`include_prompt:true` 拿可注入文本） |
-| POST | `/v1/ingest/messages` `/v1/messages/ingest` | 写入原始聊天（v2 只落 raw，不触发旧抽取） |
-| GET / PATCH | `/v1/memory_boot` | 冷启动包：digest + 昨日日志 + precious + glossary + longtail + 今日消息 + 统计；PATCH 写 L1 摘要 |
+| POST | `/v1/search/memories` `/v1/memory/search` | 记忆搜索（reranker 后原文直出；`filter:false` 跳 reranker，`include_prompt:true` 拿可注入文本；**无**注入记账） |
+| POST | `/v1/memory/recall` | v2 动态召回（见下节）；hook 客户端应优先使用 |
+| POST | `/v1/ingest/messages` `/v1/messages/ingest` | 写入原始聊天（v2 只落 raw） |
+| GET | `/v1/memory_boot` | 冷启动包：印象梯（昨日 daily + 最近 weekly/monthly）+ precious + glossary + 今日消息 + 统计 |
+| GET | `/v1/diary?date=YYYY-MM-DD` | 读单日日记（`daily_log`）；无记录 404 |
+| GET | `/v1/diary/recent` | 今日+昨日日记（存在几条给几条） |
 | GET / POST / DELETE | `/v1/precious` `/v1/precious/:id` | 珍贵记忆（只增不删的原文） |
 | GET / POST / PATCH / DELETE | `/v1/glossary` `/v1/glossary/:id` | 黑话表（term + aliases + definition） |
 | GET | `/v1/candidates` | 候选审核队列列表（`status` 默认 pending） |
-| POST | `/v1/candidates/:id/approve` | 通过候选 → 落库 |
+| POST | `/v1/candidates/:id/approve` | 通过候选 → 落库；响应带 `action`（`created` / `superseded` / `upserted`） |
 | POST | `/v1/candidates/:id/discard` | 丢弃候选 |
 | POST | `/v1/candidates/:id/merge` | 合并到既有记忆（`target_id`） |
 | POST | `/v1/candidates/:id/supersede` | 取代既有记忆（`target_id`） |
@@ -229,12 +242,28 @@ workers-ai/@cf/...         → env.AI.run（不走 AI Gateway）
 | GET | `/v1/debug/cache_health` | 缓存健康 |
 | GET | `/v1/debug/vector_health` | 向量库健康 |
 | POST | `/v1/debug/vector_reindex` | 向量重建 |
+| POST | `/admin/monthly-rollup` | 手触发月级 rollup（35 天前的 weekly_log → monthly_log） |
 
 所有非 `/health` `/admin` `/v1/models` 端点都要 `Authorization: Bearer <CHATBOX_API_KEY>`，按 scope（`memory:read` / `memory:write`）鉴权。
 
+### POST `/v1/memory/recall`
+
+与 `/v1/memory/search` 相同鉴权（`memory:read`）。JSON body：
+
+| 字段 | 说明 |
+|---|---|
+| `query` | 必填，当前轮用户文本 |
+| `namespace` | 可选，默认 profile namespace |
+| `k` / `top_k` | 可选，召回条数上限（默认 `MEMORY_TOP_K`，服务端钳 1–100） |
+| `min_score` | 可选，0–1 分数地板 |
+| `types` | 可选，记忆类型过滤 |
+| `include_prompt` | 可选，为 true 且有命中时返回可注入 `prompt` |
+
+走 v2 `runRecall` 管线，含三道去重闸（珍贵不进召回池、与核心层指纹去重、近期注入 decay）并更新 `last_injected_at`；每轮 hook 客户端应优先用此端点而非 `/search`（后者为原始搜索，不做注入记账）。
+
 ## MCP 工具（`/mcp`）
 
-v2 暴露 15 个工具。`memory_create` 已废弃，调用会报错要求改用 `memory_upsert`。
+v2 暴露 14 个工具。`memory_create`、`digest_get`、`digest_set` 已废弃；日记用 `diary_get`。
 
 | 工具 | 作用 | 关键参数 / 备注 |
 |---|---|---|
@@ -244,51 +273,69 @@ v2 暴露 15 个工具。`memory_create` 已废弃，调用会报错要求改用
 | `memory_get` | 取单条 | `id` |
 | `memory_delete` | 软删 | `id` |
 | `memory_ingest` | 写入消息 + 触发维护 | v2 只落 raw |
-| `memory_boot` | 拉冷启动包 | digest + 日志 + precious + glossary + longtail |
+| `memory_boot` | 拉冷启动包 | 昨日日志 + precious + glossary |
+| `diary_get` | 读日记 | `date` 可选，缺省=今日+昨日 |
 | `memory_recall` | 召回并返回可注入文本 | 用于 MCP 客户端自己拼上下文 |
 | `memory_pin` | 写珍贵记忆 | 只增不删 |
 | `glossary_set` | 写黑话术语 | term / aliases / definition |
 | `memory_upsert` | v2 主写入（需 `fact_key`） | 撞键 → supersede / mark-seen |
 | `memory_supersede` | 显式取代 | `old_id` + 新内容 |
 | `memory_archive` | 归档 | `id` |
-| `digest_get` | 读 L1 摘要 | — |
-| `digest_set` | 写 L1 摘要 | `content`（截 500 字） |
+## 记忆管线（v3）
 
-## 记忆管线
-
-**注入（聊天前）：**
+**写入：**
 
 ```
-取最后一条 user 消息 → embedding → Vectorize 搜索 top K
-→ 分数地板过滤噪音 → 去重 → reranker 重排 → 压缩模型精简
-→ 作为 dynamic_memory_patch 追加到当前 user turn（不打 cache_control）
+agent 直写：memory_upsert / memory_supersede（MCP 或 REST）→ 直接落库
+dream 夜间（cron `10 20 * * *`）：
+  ├─ 从当天 raw messages 抽稳定事实 → 全部进 candidates（status=pending）
+  ├─ 合并/更新/删除建议 → 同样进 candidates（world_fact supersede 除外，直接落库）
+  │   └─ dream_update 候选继承目标记忆的 fact_key（不再硬编码 null）
+  ├─ 入队前 dedup gate 提示：向量相似命中且尚无 target → 写入 target_memory_id（不拦截）
+  ├─ 重要原文摘录 → candidates
+  ├─ 写 daily_log（title + summary）
+  ├─ weekly rollup（daily_log → weekly_log）
+  └─ monthly rollup（35 天前的 weekly_log 按月合并；同月 ≥2 周才卷，孤儿周等下月或并入已有 monthly）
 ```
 
-**抽取（每 4 小时 cron `0 */4 * * *`）：**
+候选 approve（面板或 `POST /v1/candidates/:id/approve`）：
+  ├─ `target_memory_id` 指向活跃记忆 → 直接 supersede
+  ├─ target 已失效 → 回落写入查重闸
+  ├─ 有 fact_key → upsert
+  ├─ 无 fact_key + `DEDUP_COSINE` 命中 → supersede（向量异常 fail-open，走 create）
+  └─ 响应带 `action`：`created` / `superseded` / `upserted`
+
+**印象梯（boot 稳定前缀）：** `[Impressions]` = 昨日 daily_log + 最近 weekly_log + 最近 monthly_log，预算 `IMPRESSION_LADDER_MAX_CHARS`（默认 1000），超出从月级往上截。不走召回通道。
+
+**隔离不变量：** daily_log / weekly_log / monthly_log 永不 embed、永不进 `/v1/memory/search` 与 `runRecall`。
+
+**召回（聊天前 / memory_recall）：**
 
 ```
-按 4h 窗口读 D1 messages（首次无游标只处理当前窗口，不从 1970 回抽）
-→ EXTRACT_MODEL 抽稳定事实，带 fact_key
-→ confidence < EXTRACT_REVIEW_CONFIDENCE(0.76) 进候选审核队列
-→ 有 fact_key：撞键且 embedding cosine ≥ DEDUP_COSINE(0.9) → mark-seen；否则 supersede
-→ 无 fact_key：按同 type 的 Vectorize cosine 判重，命中 → mark-seen；否则新建
-→ 游标推进；窗口抽完写 done 标记；model error 不推进，下个 cron 重试
+取最后一条 user 消息 → embedding → Vectorize 搜索
+→ 分数地板 → 去重 → reranker 重排 → 记忆原文直出（默认 k=3, min_score=0.15）
+→ dynamic_memory_patch 追加到当前 user turn（不打 cache_control）
 ```
 
-**整理（每天 04:10 本地时区 cron `10 20 * * *`）：**
+**日记：** `GET /v1/diary` 或 MCP `diary_get`——agent 自己 fetch，**永不自动注入**。
 
-```
-scheduled dream：
-  ├─ 不再首次抽取（已交给 4h extractor），memories_to_add 默认空
-  ├─ 合并重复、替换过时、更新冲突（memories_to_update / memories_to_delete）
-  ├─ 保留重要原文摘录
-  └─ 重写 L1 摘要（截 500 字）+ 昨日日志
-```
+### GitHub daily source
+
+cmh-lite 客户端每天 23:50（本地时区）会把 `archive/daily/YYYY-MM-DD.md` push 到 GitHub 私库。Aelios 在现有 cron（`10 20 * * *` UTC = 04:10 SGT，晚于 push 约 4 小时）里顺带拉取**昨天**的 daily 文件，解析 turn 行与 checkpoint writer 摘要，走与 `/v1/ingest/messages` 相同的 `saveIngestMessages` 管道入库，供夜间 dream 整理。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GITHUB_DAILY_REPO` | 空（禁用） | `owner/repo` 格式 |
+| `GITHUB_DAILY_PATH` | `archive/daily` | 仓库内目录 |
+| `GITHUB_DAILY_NAMESPACE` | `DREAM_NAMESPACE` 或 `default` | 入库 namespace |
+| `GITHUB_DAILY_TOKEN` | Secret | fine-grained PAT，**只读**目标仓库 Contents |
+
+客户端怎么产出这些 daily 文件：用 [memory-template](https://github.com/wusaki0723/memory-template) 建你的私有 vault 仓库——它内建 cmh-lite hooks（压缩前 checkpoint、开场注回、每晚自动 commit/push `archive/daily/`）。把 Worker 的 `GITHUB_DAILY_REPO` 指到那个私库，链路就通了。
 
 **清理（后台 Queue，24h 节流）：**
 
 ```
-messages: 14 天删
+messages: 7 天删（可用 `MESSAGES_RETENTION_DAYS` 配置）
 usage_logs: 30 天删
 memory_events: 30 天删
 idempotency_keys: 7 天删
@@ -319,36 +366,32 @@ hard delete: deleted/superseded/expired 超 30 天 → 先删 Vectorize 再删 D
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `CHAT_MODEL` | `deepseek/deepseek-v4-pro` | 主聊天 |
-| `EXTRACT_MODEL` | `deepseek/deepseek-v4-flash` | 4h 小批抽取 |
-| `DREAM_MODEL` | `deepseek/deepseek-v4-pro` | 夜间整理 |
-| `VISION_MODEL` | `google-ai-studio/gemini-3-flash-preview` | 看图 |
-| `EMBEDDING_MODEL` | `workers-ai/@cf/google/embeddinggemma-300m` | 嵌入 |
-| `EMBEDDING_DIMENSIONS` | `768` | 非 Workers AI embedding 目标维度 |
+| `DREAM_MODEL` | `workers-ai/@cf/openai/gpt-oss-120b` | 夜间 dream（抽取+整理） |
+| `VISION_MODEL` | `workers-ai/@cf/google/gemma-4-26b-a4b-it` | 看图 |
+| `EMBEDDING_MODEL` | `workers-ai/@cf/baai/bge-m3` | 嵌入 |
+| `EMBEDDING_DIMENSIONS` | `1024` | 非 Workers AI embedding 目标维度 |
 | `MEMORY_RERANKER_MODEL` | `workers-ai/@cf/baai/bge-reranker-base` | reranker |
 | `ENABLE_MEMORY_RERANKER` | `true` | `false` 跳过 |
-| `MEMORY_FILTER_MODEL` | `workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast` | 压缩 |
 
-### 记忆抽取 / 整理
+### 记忆召回 / dream
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `EXTRACT_MAX_MESSAGES` | `40` | 每窗口最多处理消息数 |
-| `EXTRACT_MAX_RUNS` | `4` | 每次 cron 最多连续批数 |
-| `EXTRACT_MAX_TOKENS` | `1200` | 抽取模型输出上限 |
-| `EXTRACT_REVIEW_CONFIDENCE` | `0.76` | 低于此值进候选队列 |
-| `DEDUP_COSINE` | `0.9` | embedding 判重阈值 |
+| `DEDUP_COSINE` | `0.9` | embedding 判重阈值（judge + 写入查重闸 approve） |
+| `IMPRESSION_LADDER_MAX_CHARS` | `1000` | boot 印象梯字符预算 |
 | `MEMORY_FILTER_MAX_CANDIDATES` | `12` | 进 reranker 候选上限 |
-| `MEMORY_FILTER_MAX_OUTPUT` | `5` | 注入条数 |
-| `MEMORY_FILTER_OUTPUT_CHARS` | `300` | 每条压缩后字数 |
-| `MEMORY_FILTER_MAX_TOKENS` | `1400` | 压缩模型 JSON 上限 |
+| `MEMORY_FILTER_MAX_OUTPUT` | `3` | 注入条数（代理默认 k） |
 | `MEMORY_FILTER_MIN_SCORE` | `0.1` | 进 reranker 前地板（故意低） |
-| `MEMORY_MIN_IMPORTANCE` | `0.55` | 写入最低重要性 |
+| `RECALL_MIN_SCORE` | `0.15` | 召回分数地板 |
 | `DREAM_TIME_ZONE` | `Asia/Singapore` | 按此时区切自然日 |
 | `DREAM_MAX_MESSAGES` | `40` | 每次 dream 最多消息数 |
 | `DREAM_MAX_RUNS` | `10` | 每次 cron 最多 dream 批数 |
 | `DREAM_MAX_TOKENS` | `8000` | dream 输出上限 |
 | `DREAM_MEMORY_CONTEXT_LIMIT` | `40` | dream 参考旧记忆数 |
-| `DREAM_EXCERPT_LIMIT` | `8` | 每天最多原文段落数 |
+| `GITHUB_DAILY_REPO` | 空 | GitHub daily 源仓库，`owner/repo`；空 = 禁用 |
+| `GITHUB_DAILY_PATH` | `archive/daily` | daily markdown 目录 |
+| `GITHUB_DAILY_NAMESPACE` | 空 | 入库 namespace，默认跟 `DREAM_NAMESPACE` |
+| `GITHUB_DAILY_TOKEN` | Secret | fine-grained PAT，只读目标仓库 Contents |
 
 ### Claude 缓存
 
@@ -362,7 +405,6 @@ hard delete: deleted/superseded/expired 超 30 天 → 先删 Vectorize 再删 D
 | `ANTHROPIC_CACHE_USER_ID` | 空 | 多客户端 cache 隔离用 `metadata.user_id` |
 | `ANTHROPIC_THINKING_ENABLED` | `false` | 深度思考 |
 | `ANTHROPIC_THINKING_BUDGET` | `1024` | 思考 token（1024–32000） |
-| `FORCE_ANTHROPIC_NATIVE` | 空 | `true` 强制 Anthropic native |
 | `CUSTOM_ANTHROPIC_MESSAGES_PATH` | `messages` | 原生 messages 路径 |
 
 ### 高级
@@ -407,9 +449,15 @@ CLEANUP_MODEL="deepseek/deepseek-v4-flash" \
 npm run vectorize:clean:llm
 ```
 
+## 致谢
+
+- 关系图 + 2-hop 联想召回、`fact_key` 事实版本化、perception 自发浮现这三个设计，参考自 [LMC-5（Living Memory Coordinate-5）](https://github.com/wuxuyun0606-collab/lmc-5) 的 Y/Z 轴与 spontaneous recall 模型。LMC-5 是 PostgreSQL/pgvector 参考实现，Aelios 按 CF Worker + D1 + Vectorize 的形状重写了这三样，只抄了模型没抄代码——但思路是人家的，谢谢。
+
 ## License
 
-MIT
+AGPL-3.0
+
+可自由使用、修改本软件；但若你将修改后的版本对外提供网络服务，须以相同许可开源修改后的源码。
 
 ## 交流与反馈
 

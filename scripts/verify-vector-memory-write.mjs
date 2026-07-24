@@ -11,23 +11,43 @@
  */
 
 import { strict as assert } from "node:assert";
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const source = readFileSync(resolve(root, "src/memory/vectorStore.ts"), "utf8");
 const searchSource = readFileSync(resolve(root, "src/memory/search.ts"), "utf8");
-const digestSource = readFileSync(resolve(root, "src/memory/dailyDigest.ts"), "utf8");
+// dailyDigest may be a thin re-export after the dream/ phase split; scan barrel + phases.
+const dreamDir = resolve(root, "src/memory/dream");
+const dreamPhaseFiles = existsSync(dreamDir)
+  ? readdirSync(dreamDir).filter((name) => name.endsWith(".ts")).sort()
+  : [];
+const digestSource = [
+  readFileSync(resolve(root, "src/memory/dailyDigest.ts"), "utf8"),
+  ...dreamPhaseFiles.map((name) => readFileSync(join(dreamDir, name), "utf8"))
+].join("\n");
 const recallSource = readFileSync(resolve(root, "src/memory/v2/recall.ts"), "utf8");
 const mcpSource = readFileSync(resolve(root, "src/api/mcp.ts"), "utf8");
-const extractSource = readFileSync(resolve(root, "src/memory/extractPipeline.ts"), "utf8");
+const dreamExtractSource = readFileSync(resolve(root, "src/memory/dreamExtract.ts"), "utf8");
 const indexSource = readFileSync(resolve(root, "src/index.ts"), "utf8");
 const wranglerSource = readFileSync(resolve(root, "wrangler.toml"), "utf8");
 const queueProducerSource = readFileSync(resolve(root, "src/queue/producer.ts"), "utf8");
-const dbV2Source = readFileSync(resolve(root, "src/db/v2.ts"), "utf8");
+// db/v2.ts may be a barrel; prefer domain modules under db/v2/ when present.
+const dbV2Dir = resolve(root, "src/db/v2");
+const dbV2DomainFiles = existsSync(dbV2Dir)
+  ? readdirSync(dbV2Dir).filter((name) => name.endsWith(".ts")).sort()
+  : [];
+const dbV2Source =
+  dbV2DomainFiles.length > 0
+    ? dbV2DomainFiles.map((name) => readFileSync(join(dbV2Dir, name), "utf8")).join("\n")
+    : readFileSync(resolve(root, "src/db/v2.ts"), "utf8");
 const memoriesApiSource = readFileSync(resolve(root, "src/api/memories.ts"), "utf8");
-const adminSource = readFileSync(resolve(root, "src/api/admin.ts"), "utf8");
+// admin.ts may be a barrel; UI template contracts live in admin/ui.ts when split.
+const adminUiPath = resolve(root, "src/api/admin/ui.ts");
+const adminSource = existsSync(adminUiPath)
+  ? readFileSync(adminUiPath, "utf8")
+  : readFileSync(resolve(root, "src/api/admin.ts"), "utf8");
 const candidateJudgeSource = readFileSync(resolve(root, "src/memory/candidateJudge.ts"), "utf8");
 
 function indexOfOrThrow(haystack, needle) {
@@ -89,12 +109,9 @@ assert.match(searchSource, /if \(vectorOutcome\) \{\s+unbackedDropped = vectorOu
 assert.match(searchSource, /score: record\.score \* getLegacyFallbackScoreFactor\(env\)/);
 assert.match(searchSource, /\)\.slice\(0, input\.topK\);/);
 
-assert.match(digestSource, /function shouldArchiveDreamDeletesToLongtail\(env: Env\): boolean \{\s+return readString\(env\.DREAM_ARCHIVE_DELETES_TO_LONGTAIL\) === "true";\s+\}/);
-assert.match(digestSource, /async function queueImportantExcerptsForReview/);
 assert.match(digestSource, /createMemoryCandidate\(env\.DB, \{/);
-assert.match(digestSource, /source: "dream_excerpt"/);
-assert.match(digestSource, /const archiveDeletesToLongtail = shouldArchiveDreamDeletesToLongtail\(env\);/);
-assert.match(digestSource, /if \(archiveDeletesToLongtail\) \{\s+const lt = await createLongtail/s);
+assert.match(digestSource, /source: "dream_extract"/);
+assert.match(digestSource, /findSimilarActiveMemory/);
 assert.match(digestSource, /async function selectDreamMemoryContext/);
 assert.match(digestSource, /existingMemories = await selectDreamMemoryContext\(env, \{/);
 assert.match(digestSource, /const results = await searchMemories\(env, \{/);
@@ -107,29 +124,26 @@ assert.match(recallSource, /RECALL_MIN_SCORE \?\? 0\.15/);
 assert.match(recallSource, /min_score\?: number;/);
 assert.match(recallSource, /floored_ids: string\[\];\s+floored_count: number;\s+min_score: number;/);
 assert.match(recallSource, /const minScore = readRecallMinScore\(env, input\.min_score\);/);
-assert.match(recallSource, /const beforeFloor = \[\.\.\.afterDedup, \.\.\.longtailHits\]/);
+assert.match(recallSource, /const beforeFloor = \[\.\.\.afterRelation, \.\.\.longtailHits\]/);
 assert.match(recallSource, /if \(hit\.score >= minScore\) return true;\s+flooredIds\.push\(hit\.id\);/s);
 assert.match(recallSource, /floored_ids: flooredIds,\s+floored_count: flooredIds\.length,\s+min_score: minScore,/s);
 assert.match(mcpSource, /min_score: \{ type: "number", minimum: 0, maximum: 1 \}/);
 assert.match(mcpSource, /min_score: typeof args\.min_score === "number" \? readNumber\(args\.min_score, 0\.15\) : undefined/);
-assert.match(wranglerSource, /crons = \["0 \*\/4 \* \* \*", "10 20 \* \* \*"\]/);
-assert.match(wranglerSource, /EXTRACT_MODEL = "deepseek\/deepseek-v4-flash"/);
+assert.match(wranglerSource, /crons = \["10 20 \* \* \*"\]/);
+assert.match(wranglerSource, /DREAM_MODEL = "workers-ai\/@cf\/openai\/gpt-oss-120b"/);
 assert.match(wranglerSource, /DEDUP_COSINE = "0\.9"/);
-assert.match(indexSource, /const EXTRACT_CRON = "0 \*\/4 \* \* \*"/);
-assert.match(indexSource, /runMemoryExtractionBatches\(env, namespace, \{ scheduledTime: controller\.scheduledTime \}\)/);
+assert.match(indexSource, /handleDiaryApi\(request, env\)/);
+assert.doesNotMatch(indexSource, /runMemoryExtractionBatches/);
 assert.match(indexSource, /url\.pathname\.startsWith\("\/v1\/longtail\/"\)/);
 assert.match(indexSource, /handleLongtailApi\(request, env\)/);
-assert.match(queueProducerSource, /if \(isV2Enabled\(env\)\) return;/);
-assert.match(extractSource, /const DEFAULT_EXTRACT_MODEL = "deepseek\/deepseek-v4-flash"/);
-assert.match(extractSource, /const DEFAULT_DEDUP_COSINE = 0\.9/);
-assert.match(extractSource, /function cosineSimilarity\(a: number\[\], b: number\[\]\): number/);
-assert.match(extractSource, /async function isSameFactByEmbedding/);
-assert.match(extractSource, /function previousWindowStartIso\(endIso: string\): string/);
-assert.match(extractSource, /const startIso = cursor \?\? previousWindowStartIso\(endIso\);/);
-assert.match(extractSource, /getActiveMemoryByFactKey\(env\.DB, \{ namespace: input\.namespace, factKey \}\)/);
-assert.match(extractSource, /await isSameFactByEmbedding\(env, \{/);
-assert.match(extractSource, /await supersedeMemory\(env, \{/);
-assert.match(extractSource, /findEmbeddingDuplicate\(env,/);
+assert.doesNotMatch(queueProducerSource, /enqueueMemoryMaintenanceIfNeeded/);
+assert.match(dreamExtractSource, /const DEFAULT_WORKERS_AI_DREAM_MODEL = "workers-ai\/@cf\/openai\/gpt-oss-120b"/);
+assert.match(dreamExtractSource, /export function buildDreamExtractPrompt/);
+assert.match(dreamExtractSource, /export async function extractDreamMemoriesFromMessages/);
+assert.match(digestSource, /source: "dream_extract"/);
+assert.match(digestSource, /buildDreamRoutingPlan/);
+assert.match(mcpSource, /name: "diary_get"/);
+assert.match(mcpSource, /is deprecated in v3; digest lives in the client system prompt/);
 assert.match(dbV2Source, /await db\.batch\(\[ensureLifecycle, markSeen\]\);/);
 assert.match(dbV2Source, /export async function fetchLongtailByIds/);
 assert.match(dbV2Source, /function candidateLongtailVectorIds/);
@@ -161,11 +175,10 @@ assert.match(adminSource, /async createMemory\(\)/);
 assert.match(adminSource, /'\/v1\/memories'\), \{\s+method: 'POST'/s);
 assert.match(adminSource, /await crypto\.subtle\.digest\('SHA-1', data\)/);
 // Types are enforced at the write boundary — no free-form types allowed.
-assert.match(extractSource, /import \{ clampMemoryType \} from "\.\/canonicalTypes"/);
-assert.match(extractSource, /type: clampMemoryType\(readString\(raw\.type\)\)/);
-assert.match(extractSource, /type 只能从这 8 个里选/);
-assert.match(extractSource, /type: "fact"/);
-assert.match(dbV2Source, /import \{ clampMemoryType \} from "\.\.\/memory\/canonicalTypes"/);
+assert.match(dreamExtractSource, /import \{ clampMemoryType \} from "\.\/canonicalTypes"/);
+assert.match(dreamExtractSource, /type: clampMemoryType\(readString\(raw\.type\)\)/);
+assert.match(dreamExtractSource, /type 只能从这 8 个里选/);
+assert.match(dbV2Source, /import \{ clampMemoryType \} from "(?:\.\.\/)+memory\/canonicalTypes"/);
 assert.match(dbV2Source, /clampMemoryType\(input\.type, "note"\)/);
 assert.match(dbV2Source, /clampMemoryType\(input\.type, "fact"\)/);
 assert.match(dbV2Source, /clampMemoryType\(input\.newType, "fact"\)/);
@@ -174,9 +187,9 @@ assert.match(source, /type: clampMemoryType\(input\.type, "note"\),/);
 assert.match(memoriesApiSource, /clampMemoryType\(readString\(body\.type\), "note"\)/);
 assert.match(memoriesApiSource, /clampMemoryType\(readString\(body\.type\) \|\| candidate\.type, "note"\)/);
 assert.match(digestSource, /memories_to_update 里的 type 只能从这 8 个里选/);
-assert.doesNotMatch(extractSource, /type: "project"/);
+assert.doesNotMatch(dreamExtractSource, /type: "project"/);
 assert.doesNotMatch(dbV2Source, /input\.newType \?\? "world_fact"/);
-assert.match(digestSource, /v2 首次抽取由每 4 小时 extractor 负责/);
+assert.match(digestSource, /memories_to_add 默认给空数组/);
 assert.doesNotMatch(digestSource, /for \(const memory of digest\.memories_to_add \?\? \[\]\) \{\s+const factKey/s);
 assert.doesNotMatch(digestSource, /added \+= 0/);
 assert.match(candidateJudgeSource, /judgeResult\.score >= approveMin && judgeResult\.grounded && judgeResult\.durable/);

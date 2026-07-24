@@ -8,10 +8,12 @@ import { deleteMemoryEmbedding, upsertMemoryEmbedding } from "../memory/embeddin
 import { exportMemories } from "../memory/export";
 import { filterAndCompressMemoriesWithMeta } from "../memory/filter";
 import { formatMemoryPatch } from "../memory/inject";
+import { findSimilarActiveMemory } from "../memory/dedupGate";
 import { searchMemories, toMemoryApiRecord } from "../memory/search";
 import { deleteVectorMemory } from "../memory/vectorStore";
 import { clampMemoryType } from "../memory/canonicalTypes";
 import {
+  archiveMemory,
   countActiveMemoriesByType,
   countMemoryCandidates,
   createPrecious,
@@ -20,11 +22,9 @@ import {
   deletePrecious,
   updatePrecious,
   fetchMemoryLifecycleRows,
-  getDigest,
   getDailyLog,
   getMemoryCandidateById,
   listGlossary,
-  listLongtail,
   listMemoryCandidates,
   listPrecious,
   markMemoriesInjected,
@@ -32,11 +32,10 @@ import {
   supersedeMemory,
   updateGlossary,
   updateMemoryCandidateStatus,
-  upsertDigest,
   upsertGlossary,
   upsertMemoryByFactKey
 } from "../db/v2";
-import { isV2Enabled } from "../memory/v2/recall";
+import { isV2Enabled, runRecall } from "../memory/v2/recall";
 import {
   decayForLastInjected,
   fatigueAlpha,
@@ -44,8 +43,8 @@ import {
   injectDecayFactor,
   injectDecayWindowMs
 } from "../memory/rotation";
-import { enqueueMemoryMaintenanceIfNeeded } from "../queue/producer";
-import type { Env, KeyProfile } from "../types";
+
+import type { Env, KeyProfile, MemoryApiRecord } from "../types";
 import { json, openAiError } from "../utils/json";
 import {
   readBoolean,
@@ -261,6 +260,109 @@ async function handleSearchMemories(request: Request, env: Env, profile: KeyProf
   });
 }
 
+function readRecallK(body: Record<string, unknown>, env: Env): number {
+  const raw = body.k !== undefined ? body.k : body.top_k;
+  const fallback = Number(env.MEMORY_TOP_K || 50);
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return Math.floor(raw);
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) return Math.floor(parsed);
+  }
+  return Number.isFinite(fallback) ? Math.floor(fallback) : 50;
+}
+
+async function handleRecallMemories(request: Request, env: Env, profile: KeyProfile): Promise<Response> {
+  const scopeError = requireScope(profile, "memory:read");
+  if (scopeError) return scopeError;
+
+  if (!isV2Enabled(env)) {
+    return handleSearchMemories(request, env, profile);
+  }
+
+  const body = await readJsonObject(request);
+  if (!body) return openAiError("Request body must be a JSON object", 400);
+
+  const query = readString(body.query) || "";
+  if (!query) return openAiError("query is required", 400);
+
+  const namespace = resolveNamespace(profile, body.namespace);
+  const k = readRecallK(body, env);
+  const minScore = typeof body.min_score === "number" && Number.isFinite(body.min_score)
+    ? body.min_score
+    : undefined;
+  const types = readStringArray(body.types);
+  const includePrompt = readBoolean(body.include_prompt);
+  // LMC-5 additive: explicit history opt-in (superseded rows). Default false.
+  const includeHistory = readBoolean(body.include_history, false);
+
+  const result = await runRecall(env, {
+    namespace,
+    query,
+    k,
+    min_score: minScore,
+    types,
+    include_history: includeHistory
+  });
+  const data = result.hits.map((h) => ({
+    id: h.id,
+    content: h.content,
+    type: h.type,
+    score: h.score,
+    importance: 0.5,
+    source: h.source,
+    source_layer: h.source_layer
+  }));
+
+  let prompt: string | undefined;
+  if (includePrompt && data.length > 0) {
+    const promptRecords: MemoryApiRecord[] = data.map((d) => ({
+      id: d.id,
+      namespace,
+      type: d.type,
+      content: d.content,
+      summary: null,
+      importance: d.importance,
+      confidence: 0.8,
+      status: "active",
+      pinned: false,
+      tags: [],
+      source: d.source,
+      source_message_ids: [],
+      vector_id: null,
+      last_recalled_at: null,
+      recall_count: 0,
+      created_at: "",
+      updated_at: "",
+      expires_at: null,
+      score: d.score
+    }));
+    const patch = formatMemoryPatch(promptRecords);
+    if (result.glossary_hits.length > 0) {
+      const glossaryLines = result.glossary_hits.map(
+        (g) => `- [glossary] ${g.term}: ${g.definition}`
+      );
+      prompt = patch ? `${patch}\n${glossaryLines.join("\n")}` : glossaryLines.join("\n");
+    } else {
+      prompt = patch || undefined;
+    }
+  }
+
+  return json({
+    data,
+    meta: {
+      namespace,
+      backend: "v2-recall",
+      top_k: k,
+      count: data.length,
+      glossary_hits: result.glossary_hits.length,
+      ...result.meta
+    },
+    ...(prompt ? { prompt } : {})
+  });
+}
+
 async function handleIngestMemories(
   request: Request,
   env: Env,
@@ -288,18 +390,6 @@ async function handleIngestMemories(
     source,
     messages
   });
-
-  if (body.auto_extract !== false && ids.length > 0) {
-    ctx.waitUntil(
-      enqueueMemoryMaintenanceIfNeeded(env, {
-        namespace,
-        conversationId: conversation.id,
-        fromMessageId: ids[0],
-        toMessageId: ids[ids.length - 1],
-        source
-      })
-    );
-  }
 
   return json({
     data: {
@@ -334,7 +424,8 @@ async function handleRunDigest(
     for (let i = 0; i < maxRuns; i += 1) {
       const result = await runDailyMemoryDigest(env, namespace, {
         dateLabel: target,
-        force: force && i === 0
+        force: force && i === 0,
+        trigger: "manual"
       });
       runs.push(result);
       if (!result.ran || !result.stats?.hasMore) break;
@@ -409,33 +500,20 @@ export async function handleMemoryBoot(request: Request, env: Env): Promise<Resp
   const auth = await authenticate(request, env);
   if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
 
+  if (request.method !== "GET") return openAiError("Not found", 404);
+
   const url = new URL(request.url);
   const namespace = resolveNamespace(auth.profile, url.searchParams.get("namespace"));
-
-  if (request.method === "PATCH") {
-    const scopeError = requireScope(auth.profile, "memory:write");
-    if (scopeError) return scopeError;
-    const body = await readJsonObject(request);
-    if (!body) return openAiError("Request body must be a JSON object", 400);
-    const content = readString(body.content);
-    if (!content) return openAiError("content is required", 400);
-    const digest = await upsertDigest(env.DB, { namespace, content: content.slice(0, 1200) });
-    return json({ data: digest });
-  }
-
-  if (request.method !== "GET") return openAiError("Not found", 404);
   const scopeError = requireScope(auth.profile, "memory:read");
   if (scopeError) return scopeError;
 
   const start = readString(url.searchParams.get("start")) || new Date().toISOString().slice(0, 10) + "T00:00:00.000Z";
   const end = readString(url.searchParams.get("end")) || new Date().toISOString();
   const dailyDate = readString(url.searchParams.get("daily_date")) || yesterdayDateLabel();
-  const [digest, dailyLog, precious, glossary, longtail, todayMessages, todayRawCount, pendingCount, typeCounts] = await Promise.all([
-    getDigest(env.DB, namespace),
+  const [dailyLog, precious, glossary, todayMessages, todayRawCount, pendingCount, typeCounts] = await Promise.all([
     getDailyLog(env.DB, { namespace, date: dailyDate }),
     listPrecious(env.DB, { namespace, limit: 100 }),
     listGlossary(env.DB, { namespace }),
-    listLongtail(env.DB, { namespace, limit: 80 }),
     listMessagesByNamespaceInRange(env.DB, {
       namespace,
       startCreatedAt: start,
@@ -450,11 +528,9 @@ export async function handleMemoryBoot(request: Request, env: Env): Promise<Resp
   return json({
     data: {
       namespace,
-      digest,
       daily_log: dailyLog,
       precious,
       glossary,
-      longtail,
       today_messages: todayMessages,
       stats: {
         today_raw_count: todayRawCount,
@@ -463,6 +539,54 @@ export async function handleMemoryBoot(request: Request, env: Env): Promise<Resp
       }
     }
   });
+}
+
+function formatDateLabel(date: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
+}
+
+function readDiaryTimeZone(env: Env): string {
+  return env.DREAM_TIME_ZONE?.trim() || env.DAILY_DIGEST_TIME_ZONE?.trim() || "Asia/Singapore";
+}
+
+export async function handleDiaryApi(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
+  if (request.method !== "GET") return openAiError("Not found", 404);
+
+  const scopeError = requireScope(auth.profile, "memory:read");
+  if (scopeError) return scopeError;
+
+  const url = new URL(request.url);
+  const namespace = resolveNamespace(auth.profile, url.searchParams.get("namespace"));
+  const timeZone = readDiaryTimeZone(env);
+
+  if (url.pathname === "/v1/diary/recent") {
+    const today = formatDateLabel(new Date(), timeZone);
+    const yesterday = formatDateLabel(new Date(Date.now() - 24 * 60 * 60 * 1000), timeZone);
+    const rows = await Promise.all([
+      getDailyLog(env.DB, { namespace, date: today }),
+      getDailyLog(env.DB, { namespace, date: yesterday })
+    ]);
+    const data = rows.filter((row): row is NonNullable<typeof row> => Boolean(row));
+    return json({ data });
+  }
+
+  const date = readString(url.searchParams.get("date"));
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return openAiError("date query parameter is required (YYYY-MM-DD)", 400);
+  }
+
+  const row = await getDailyLog(env.DB, { namespace, date });
+  if (!row) {
+    return json({ data: null }, { status: 404 });
+  }
+  return json({ data: row });
 }
 
 export async function handlePrecious(request: Request, env: Env): Promise<Response> {
@@ -606,6 +730,12 @@ export async function handleLongtailApi(request: Request, env: Env): Promise<Res
   return json({ data: { id, deleted: true } });
 }
 
+export type ApprovedMemoryResult = {
+  id: string;
+  action: "upserted" | "superseded" | "created";
+  supersededId?: string;
+};
+
 async function createApprovedMemoryFromCandidate(
   env: Env,
   input: {
@@ -618,8 +748,9 @@ async function createApprovedMemoryFromCandidate(
     tags: string[];
     sourceMessageIds: string[];
     source: string;
+    excludeIds?: string[];
   }
-): Promise<string> {
+): Promise<ApprovedMemoryResult> {
   if (input.factKey) {
     const result = await upsertMemoryByFactKey(env, {
       namespace: input.namespace,
@@ -632,7 +763,29 @@ async function createApprovedMemoryFromCandidate(
       source: input.source,
       sourceMessageIds: input.sourceMessageIds
     });
-    return result.id;
+    return { id: result.id, action: "upserted" };
+  }
+
+  const hit = await findSimilarActiveMemory(env, {
+    namespace: input.namespace,
+    content: input.content,
+    excludeIds: input.excludeIds
+  });
+  if (hit) {
+    const result = await supersedeMemory(env, {
+      namespace: input.namespace,
+      oldId: hit.memory.id,
+      newContent: input.content,
+      newType: input.type,
+      newFactKey: null,
+      importance: input.importance,
+      confidence: input.confidence,
+      tags: input.tags,
+      source: input.source,
+      sourceMessageIds: input.sourceMessageIds,
+      reason: "dedup_gate_supersede"
+    });
+    return { id: result.newId, action: "superseded", supersededId: hit.memory.id };
   }
 
   const created = await createMemory(env.DB, {
@@ -646,7 +799,7 @@ async function createApprovedMemoryFromCandidate(
     sourceMessageIds: input.sourceMessageIds
   });
   await syncMemoryEmbeddingBestEffort(env, created);
-  return created.id;
+  return { id: created.id, action: "created" };
 }
 
 export async function handleMemoryCandidates(request: Request, env: Env): Promise<Response> {
@@ -688,7 +841,66 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
     : parseJsonArray(candidate.source_message_ids);
 
   if (action === "approve") {
-    const memoryId = await createApprovedMemoryFromCandidate(env, {
+    if (candidate.source === "dream_delete" && candidate.target_memory_id) {
+      const archived = await archiveMemory(env, { namespace, id: candidate.target_memory_id });
+      if (!archived) return openAiError("Target memory not found", 404);
+      const updated = await updateMemoryCandidateStatus(env.DB, {
+        namespace,
+        id,
+        status: "approved",
+        targetMemoryId: candidate.target_memory_id,
+        decisionNote: readString(body.decision_note) || "dream_delete approved"
+      });
+      return json({
+        data: {
+          candidate: updated ? toCandidateApiRecord(updated) : null,
+          memory_id: candidate.target_memory_id
+        }
+      });
+    }
+
+    if (candidate.target_memory_id) {
+      const target = await getMemoryById(env.DB, { namespace, id: candidate.target_memory_id });
+      const targetActive =
+        target &&
+        target.status === "active" &&
+        target.version_status !== "superseded";
+      if (targetActive) {
+        const result = await supersedeMemory(env, {
+          namespace,
+          oldId: candidate.target_memory_id,
+          newContent: content,
+          newType: type,
+          newFactKey: factKey,
+          confidence,
+          importance,
+          tags,
+          source: "review",
+          sourceMessageIds,
+          reason: "approve_update"
+        });
+        const updated = await updateMemoryCandidateStatus(env.DB, {
+          namespace,
+          id,
+          status: "approved",
+          targetMemoryId: result.newId,
+          decisionNote: readString(body.decision_note) || "approve_update"
+        });
+        return json({
+          data: {
+            candidate: updated ? toCandidateApiRecord(updated) : null,
+            memory_id: result.newId,
+            action: "superseded",
+            superseded_id: candidate.target_memory_id
+          }
+        });
+      }
+    }
+
+    const fallbackNote = candidate.target_memory_id
+      ? `${readString(body.decision_note) || "approved"}; target_gone_fallback`
+      : readString(body.decision_note) || "approved";
+    const approval = await createApprovedMemoryFromCandidate(env, {
       namespace,
       type,
       content,
@@ -697,16 +909,24 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
       importance,
       tags,
       sourceMessageIds,
-      source: "review"
+      source: "review",
+      excludeIds: candidate.target_memory_id ? [candidate.target_memory_id] : undefined
     });
     const updated = await updateMemoryCandidateStatus(env.DB, {
       namespace,
       id,
       status: "approved",
-      targetMemoryId: memoryId,
-      decisionNote: readString(body.decision_note) || "approved"
+      targetMemoryId: approval.id,
+      decisionNote: fallbackNote
     });
-    return json({ data: { candidate: updated ? toCandidateApiRecord(updated) : null, memory_id: memoryId } });
+    return json({
+      data: {
+        candidate: updated ? toCandidateApiRecord(updated) : null,
+        memory_id: approval.id,
+        action: approval.action,
+        ...(approval.supersededId ? { superseded_id: approval.supersededId } : {})
+      }
+    });
   }
 
   if (action === "discard") {
@@ -882,6 +1102,10 @@ export async function handleMemories(request: Request, env: Env, ctx: ExecutionC
 
   if (tail.length === 1 && tail[0] === "search" && request.method === "POST") {
     return handleSearchMemories(request, env, auth.profile);
+  }
+
+  if (tail.length === 1 && tail[0] === "recall" && request.method === "POST") {
+    return handleRecallMemories(request, env, auth.profile);
   }
 
   if (tail.length === 1 && (tail[0] === "digest" || tail[0] === "dream") && request.method === "POST") {

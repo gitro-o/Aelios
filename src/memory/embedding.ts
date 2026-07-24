@@ -1,7 +1,7 @@
 import type { Env, MemoryRecord } from "../types";
 import { callOpenAICompatEmbeddings } from "../proxy/openaiAdapter";
 
-const DEFAULT_EMBEDDING_MODEL = "workers-ai/@cf/google/embeddinggemma-300m";
+const DEFAULT_EMBEDDING_MODEL = "workers-ai/@cf/baai/bge-m3";
 
 export type EmbeddingKind = "query" | "document";
 
@@ -71,7 +71,8 @@ export async function createEmbedding(
   if (workersAiModel) {
     if (!env.AI) return null;
     try {
-      const result = await env.AI.run(workersAiModel as any, { text: [input] });
+      // workersAiModel is parsed at runtime from EMBEDDING_MODEL; keyof AiModels is the narrowest safe cast.
+      const result = await env.AI.run(workersAiModel as keyof AiModels, { text: [input] });
       return readEmbedding(result);
     } catch (error) {
       console.error("memory embedding failed", error);
@@ -96,6 +97,8 @@ export async function createEmbedding(
   return readEmbedding(await response.json());
 }
 
+// 隔离不变量：daily_log / weekly_log / monthly_log 永不 embed、永不进检索通道。
+// 只有 memories 本体经 upsertMemoryEmbedding 写入 Vectorize。
 export async function upsertMemoryEmbedding(env: Env, memory: MemoryRecord): Promise<boolean> {
   if (!env.VECTORIZE || memory.status !== "active") return false;
 

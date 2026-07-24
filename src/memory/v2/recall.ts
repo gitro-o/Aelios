@@ -11,20 +11,24 @@
 //   闸三: last_injected_at 近期注入过的降权 (不动 importance)。
 
 import {
-  getDigest,
   getDailyLog,
   listPrecious,
+  type PreciousRow,
   listGlossary,
+  listRecentMonthlyLogs,
+  listRecentWeeklyLogs,
   fetchLongtailByIds,
   matchGlossary,
-  markMemoriesInjected,
-  markPreciousInjected
+  markMemoriesInjected
 } from "../../db/v2";
 import { searchMemoriesWithProvenance } from "../search";
 import type { MemoryApiRecordWithProvenance } from "../search";
 import { filterAndCompressMemories } from "../filter";
 import { createEmbedding } from "../embedding";
-import type { Env } from "../../types";
+import { expandRecallByRelations, isRelationExpansionEnabled } from "../relations";
+import type { RelationExpansionMeta } from "../relations";
+import { loadSpontaneousForBoot } from "../perception";
+import type { Env, PerceptionCacheItem } from "../../types";
 import {
   decayForLastInjected,
   fatigueAlpha,
@@ -46,7 +50,7 @@ function readRecallMinScore(env: Env, override?: number): number {
 
 // =====================================================================
 // 闸二: 注入前与核心层去重。
-// 核心层 = boot 包里的 digest(L1) + precious(L3)。
+// 核心层 = boot 包里的 precious(L3)。
 // 召回命中如果跟核心层内容高度重叠, 模型这轮已知道, 不重复喂。
 // 用归一化文本的包含/重叠检测: 召回命中内容被核心层文本包含,
 // 或与核心层某条 Jaccard 词集重叠超阈值, 则判为重复, 降到 0 分剔除。
@@ -80,18 +84,13 @@ function jaccardOverlap(a: Set<string>, b: Set<string>): number {
   return union > 0 ? inter / union : 0;
 }
 
-// 构建核心层指纹: digest + precious 的文本词集, 供闸二比对。
+// 构建核心层指纹: precious 的文本词集, 供闸二比对。
 export interface CoreFingerprint {
-  digestTokens: Set<string> | null;
   preciousTokens: Set<string>[];
 }
 
-export function buildCoreFingerprint(
-  digestContent: string | null,
-  preciousContents: string[]
-): CoreFingerprint {
+export function buildCoreFingerprint(preciousContents: string[]): CoreFingerprint {
   return {
-    digestTokens: digestContent ? tokenize(digestContent) : null,
     preciousTokens: preciousContents.filter(Boolean).map(tokenize)
   };
 }
@@ -101,13 +100,6 @@ function isDuplicateWithCore(content: string, core: CoreFingerprint): boolean {
   const hitTokens = tokenize(content);
   if (hitTokens.size === 0) return false;
 
-  // 召回命中被 digest 包含: digest 文本里出现了命中的大部分词
-  if (core.digestTokens && core.digestTokens.size > 0) {
-    if (jaccardOverlap(hitTokens, core.digestTokens) >= DEDUP_OVERLAP_THRESHOLD) {
-      return true;
-    }
-  }
-  // 与某条 precious 高度重叠
   for (const pt of core.preciousTokens) {
     if (jaccardOverlap(hitTokens, pt) >= DEDUP_OVERLAP_THRESHOLD) {
       return true;
@@ -121,75 +113,116 @@ function isDuplicateWithCore(content: string, core: CoreFingerprint): boolean {
 // SessionStart 调一次。客户端可塞进缓存前缀吃命中 (母帖第二节)。
 // =====================================================================
 
+export interface BootImpressionEntry {
+  label: string;
+  title: string;
+  summary: string;
+}
+
 export interface BootPackage {
-  digest: { content: string; updated_at: string } | null;
-  yesterday_log: { date: string; title: string; summary: string } | null;
+  impressions: {
+    daily: BootImpressionEntry | null;
+    weekly: BootImpressionEntry | null;
+    monthly: BootImpressionEntry | null;
+    max_chars: number;
+  };
   precious: Array<{ id: string; content: string; created_at: string }>;
   glossary: Array<{ term: string; definition: string; aliases: string[] }>;
+  // LMC-5: spontaneous perception (SessionStart). Absent/empty = do not inject section.
+  spontaneous?: PerceptionCacheItem[];
   schema_version: string;
   cache_prefix_end: true;
 }
 
-const BOOT_SCHEMA_VERSION = "v2-1";
+const BOOT_SCHEMA_VERSION = "v3-1";
+
+// Worker isolates make this best-effort: each isolate has its own map, no cross-isolate sharing.
+const BOOT_CACHE_TTL_MS = 60_000;
+const bootPackageCache = new Map<string, { expiresAt: number; value: BootPackage }>();
 
 export async function buildBootPackage(
   env: Env,
-  input: { namespace: string }
+  input: { namespace: string; preciousRows?: PreciousRow[] }
 ): Promise<BootPackage> {
-  const digest = await getDigest(env.DB, input.namespace);
-  const preciousRows = await listPrecious(env.DB, {
-    namespace: input.namespace,
-    limit: 20
-  });
+  const cached = bootPackageCache.get(input.namespace);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
 
-  // boot 要全量 glossary (冷启动把所有黑话定义塞进)，不是 query 命中。
-  const allGlossary = await listAllGlossary(env, input.namespace);
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const bootTimeZone = env.DREAM_TIME_ZONE || "Asia/Shanghai";
+  const yesterdayLabel = new Intl.DateTimeFormat("en-CA", {
+    timeZone: bootTimeZone,
+    year: "numeric", month: "2-digit", day: "2-digit"
+  }).format(yesterday);
 
-  // 确定性排序: precious 按 created_at 升序 (老的在前，稳定的在前)。
+  const [preciousRows, allGlossary, dailyLog, weeklyRows, monthlyRows, spontaneous] = await Promise.all([
+    input.preciousRows
+      ? Promise.resolve(input.preciousRows)
+      : listPrecious(env.DB, { namespace: input.namespace, limit: 20 }),
+    listAllGlossary(env, input.namespace),
+    getDailyLog(env.DB, { namespace: input.namespace, date: yesterdayLabel }),
+    listRecentWeeklyLogs(env.DB, { namespace: input.namespace, limit: 1 }),
+    listRecentMonthlyLogs(env.DB, { namespace: input.namespace, limit: 1 }),
+    loadSpontaneousForBoot(env, { namespace: input.namespace, timeZone: bootTimeZone }).catch((error) => {
+      console.warn("boot: load spontaneous failed", error);
+      return [] as PerceptionCacheItem[];
+    })
+  ]);
+
+  // 确定性排序: 先取最新 20 条 (listPrecious DESC)，再按 created_at 升序展示 (老的在前，稳定的在前)。
   const precious = preciousRows
+    .slice(0, 20)
     .map((r) => ({ id: r.id, content: r.content, created_at: r.created_at }))
     .sort((a, b) => a.created_at.localeCompare(b.created_at));
 
-  // 闸三对 precious 也记账: boot 被调 = precious 被注入, 记 last_injected_at。
-  // 防的是某条 precious 因太相关而被 recall 侧逻辑反复塞 (虽然闸一已把 precious 移出
-  // recall 池, 但 boot 每次冷启动都调, 记账让 precious 的注入节奏也可观测、可衰减)。
-  if (precious.length > 0) {
-    await markPreciousInjected(env.DB, {
-      namespace: input.namespace,
-      ids: precious.map((p) => p.id)
-    });
-  }
+  // Injection accounting (markPreciousInjected) is the caller's responsibility so it
+  // stays off the response path via waitUntil / fire-and-forget and is not cached.
 
-  // 昨天的日志 (dream 产出)
-  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const yesterdayLabel = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Singapore",
-    year: "numeric", month: "2-digit", day: "2-digit"
-  }).format(yesterday);
-  const dailyLog = await getDailyLog(env.DB, { namespace: input.namespace, date: yesterdayLabel });
+  const impressionMaxChars = (() => {
+    const raw = env.IMPRESSION_LADDER_MAX_CHARS;
+    if (!raw) return 1000;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 1000;
+  })();
 
-  return {
-    digest: digest ? { content: digest.content, updated_at: digest.updated_at } : null,
-    yesterday_log: dailyLog ? { date: dailyLog.date, title: dailyLog.title, summary: dailyLog.summary } : null,
+  const weekly = weeklyRows[0] ?? null;
+  const monthly = monthlyRows[0] ?? null;
+
+  const pkg: BootPackage = {
+    impressions: {
+      daily: dailyLog
+        ? { label: dailyLog.date, title: dailyLog.title, summary: dailyLog.summary }
+        : null,
+      weekly: weekly
+        ? { label: weekly.week, title: weekly.title, summary: weekly.summary }
+        : null,
+      monthly: monthly
+        ? { label: monthly.month, title: monthly.title, summary: monthly.summary }
+        : null,
+      max_chars: impressionMaxChars
+    },
     precious,
     glossary: allGlossary,
+    ...(spontaneous.length > 0 ? { spontaneous } : {}),
     schema_version: BOOT_SCHEMA_VERSION,
     cache_prefix_end: true
   };
+
+  bootPackageCache.set(input.namespace, {
+    expiresAt: Date.now() + BOOT_CACHE_TTL_MS,
+    value: pkg
+  });
+  return pkg;
 }
 
-// 服务端自建核心层指纹: 读 digest + precious, 供闸二在调用方没传指纹时用。
-// 让闸二默认生效, 不依赖 MCP 客户端配合。
+// 服务端自建核心层指纹: 读 precious, 供闸二在调用方没传指纹时用。
 async function buildCoreFingerprintFromDb(
   env: Env,
   namespace: string
 ): Promise<CoreFingerprint> {
-  const digest = await getDigest(env.DB, namespace);
   const preciousRows = await listPrecious(env.DB, { namespace, limit: 50 });
-  return buildCoreFingerprint(
-    digest?.content ?? null,
-    preciousRows.map((r) => r.content)
-  );
+  return buildCoreFingerprint(preciousRows.map((r) => r.content));
 }
 
 async function listAllGlossary(
@@ -225,6 +258,10 @@ export interface RecallInput {
   // 闸二: 调用方传 boot 包的核心层指纹, recall 命中与之去重。
   // 不传则跳过闸二 (向后兼容第 2 步行为)。
   core_fingerprint?: CoreFingerprint;
+  // LMC-5 additive: when true, allow version_status=superseded hits (history). Default false.
+  include_history?: boolean;
+  // When set (chat hot path), injection accounting is scheduled off the response path.
+  waitUntil?: (promise: Promise<unknown>) => void;
 }
 
 export interface RecallHit {
@@ -242,6 +279,9 @@ export interface RecallHit {
   backed: boolean;
   // 与 source_layer 中 memory/longtail 对应，供面板按类型统计 (不含 glossary，glossary 命中走单独的 glossary_hits)。
   kind: "memory" | "longtail";
+  // LMC-5 Y 轴 (additive, only when RELATION_EXPANSION on and hit came via edge)
+  relation?: RelationExpansionMeta;
+  contradicted_by?: string[];
 }
 
 export interface RecallResult {
@@ -286,22 +326,20 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
 
   // 2. memories 向量召回 (L4 + L6 world_fact，active only)
   //    闸一: 不查 precious。precious 归 boot 固定供给, 不进每轮 query 召回池。
-  const k = Math.min(Math.max(Math.floor(input.k ?? 20), 1), 100);
+  const k = Math.min(Math.max(Math.floor(input.k ?? 3), 1), 100);
   const searchResult = await searchMemoriesWithProvenance(env, {
     namespace: input.namespace,
     query,
     types: input.types,
-    topK: k
+    topK: k,
+    includeHistory: input.include_history === true,
+    waitUntil: input.waitUntil
   });
   const rawMemories: MemoryApiRecordWithProvenance[] = searchResult.records;
   // 严格模式下 (RECALL_REQUIRE_D1_BACKING=true) 已经在 search 层丢弃的孤儿向量命中数。
   const unbackedDropped = searchResult.unbacked_dropped;
 
-  // 2.5. 三重管线: reranker 重排 + 小模型压缩 (v1 的 filter.ts 现成逻辑)
-  //      prepareCandidates: 去重、sanitize、min score 过滤、按质量排序
-  //      rerankMemories: Workers AI bge-reranker-base 重排
-  //      LLM compress: 小模型把每条压缩成短句，无关的输出 null 剔除
-  //      filterAndCompressMemories 内部全程 {...memory} 展开，backed/source provenance 字段原样透传。
+  // 2.5. 召回精炼: prepareCandidates + reranker，记忆原文直出
   const memories = (await filterAndCompressMemories(env, {
     query,
     memories: rawMemories
@@ -330,30 +368,51 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
   });
 
   // 4. 闸二: 注入前与核心层去重。
-  //    调用方传 core_fingerprint (boot 包的 digest + precious 文本指纹)；
-  //    不传则服务端自己建 (读 digest + precious), 保证闸二默认生效。
+  //    调用方传 core_fingerprint (boot 包的 precious 文本指纹)；
+  //    不传则服务端自己建 (读 precious), 保证闸二默认生效。
   //    recall 命中与之高度重叠的降到 0 分剔除, 不重复喂。
+  //    buildCoreFingerprint always returns an object — always filter when we have hits.
+  //    Skip the DB fingerprint fallback when scored is empty (nothing to dedupe).
   const dedupedIds: string[] = [];
-  const core = input.core_fingerprint ?? (await buildCoreFingerprintFromDb(env, input.namespace));
-  const afterDedup = core
-    ? scored.filter((h) => {
-        if (isDuplicateWithCore(h.content, core)) {
-          dedupedIds.push(h.id);
-          return false;
-        }
-        return true;
-      })
-    : scored;
+  let afterDedup = scored;
+  if (scored.length > 0) {
+    const core =
+      input.core_fingerprint ?? (await buildCoreFingerprintFromDb(env, input.namespace));
+    afterDedup = scored.filter((h) => {
+      if (isDuplicateWithCore(h.content, core)) {
+        dedupedIds.push(h.id);
+        return false;
+      }
+      return true;
+    });
+  }
+
+  // 4.5 LMC-5 Y 轴: 2-hop relation expansion (default off = seed set unchanged).
+  // Runs after gate-2 dedup so expanded neighbors are also core-deduped next? We expand
+  // from afterDedup seeds, then re-cap at k. Contradicts do not boost rank.
+  let afterRelation: RecallHit[] = afterDedup;
+  if (isRelationExpansionEnabled(env) && afterDedup.length > 0) {
+    try {
+      afterRelation = (await expandRecallByRelations(env, {
+        namespace: input.namespace,
+        seedHits: afterDedup,
+        topK: k
+      })) as RecallHit[];
+    } catch (error) {
+      console.error("v2 relation expansion failed; using seed hits", error);
+      afterRelation = afterDedup;
+    }
+  }
 
   // 5. 长尾兜底 (L6): 只有 glossary + memories 闸二后全空才落 longtail。
   //    母帖逻辑优先级"全空才落长尾"——glossary 命中也算"前面非空"，
   //    有确定词面答案时不再追兜底，避免把 longtail 混进已有黑话答案的请求。
   let longtailHits: RecallHit[] = [];
-  if (afterDedup.length === 0 && glossaryHits.length === 0) {
+  if (afterRelation.length === 0 && glossaryHits.length === 0) {
     longtailHits = await recallLongtailFallback(env, input);
   }
 
-  const beforeFloor = [...afterDedup, ...longtailHits]
+  const beforeFloor = [...afterRelation, ...longtailHits]
     .sort((a, b) => b.score - a.score);
   const flooredIds: string[] = [];
   const allHits = beforeFloor
@@ -370,10 +429,15 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     .filter((h) => h.source_layer === "memory")
     .map((h) => h.id);
   if (memoryIdsToMark.length > 0) {
-    await markMemoriesInjected(env.DB, {
+    const markPromise = markMemoriesInjected(env.DB, {
       namespace: input.namespace,
       ids: memoryIdsToMark
     });
+    if (input.waitUntil) {
+      input.waitUntil(markPromise);
+    } else {
+      await markPromise;
+    }
   }
 
   return {

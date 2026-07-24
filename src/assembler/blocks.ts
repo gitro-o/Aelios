@@ -12,6 +12,7 @@
  */
 
 import type { MemoryApiRecord, OpenAIChatMessage } from "../types";
+import { contentToText, sanitizeMemoryContent } from "../utils/sanitize";
 import { preprocessHistory } from "../preset/historyPreprocess";
 import type {
   AssembledPrompt,
@@ -20,39 +21,14 @@ import type {
   CacheBreakpoint,
   SystemBlock,
 } from "./types";
-import { BLOCK_ORDER, countMessageBlocks, formatBootStable } from "./types";
+import {
+  BLOCK_ORDER,
+  countMessageBlocks,
+  formatBootStable,
+  TURN_CONTEXT_BLOCK_IDS,
+} from "./types";
 
 // ---------------------------------------------------------------------------
-// Local helpers (no external imports — keeps assembler self-contained)
-// ---------------------------------------------------------------------------
-
-function contentToText(content: OpenAIChatMessage["content"]): string {
-  if (typeof content === "string") return content;
-  if (content == null) return "";
-  return (content as unknown[])
-    .flatMap((part: unknown) => {
-      if (!part || typeof part !== "object" || Array.isArray(part)) return [];
-      const value = part as { type?: unknown; text?: unknown };
-      return value.type === "text" && typeof value.text === "string"
-        ? [value.text]
-        : [];
-    })
-    .join("\n");
-}
-
-function sanitizeMemoryContent(text: string): string {
-  return text
-    .replace(/debug-test/gi, "")
-    .replace(/记忆系统/g, "")
-    .replace(/自动记忆测试口令/g, "口令")
-    .replace(/测试口令/g, "口令")
-    .replace(/标签为?[^，。；\s]+/g, "")
-    .replace(/标签[:：]?[^，。；\s]+/g, "")
-    .replace(/[，,；;：:]\s*([。.!！?？])/g, "$1")
-    .replace(/\s{2,}/g, " ")
-    .replace(/^[，,；;：:\s]+|[，,；;：:\s]+$/g, "")
-    .trim();
-}
 
 function isNonEmptyContent(content: OpenAIChatMessage["content"]): boolean {
   if (typeof content === "string") return content.trim().length > 0;
@@ -88,72 +64,7 @@ const proxyStaticRulesBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 2: persona_pinned (stable)
-// Pinned memories where type ∈ {persona, identity}.
-// Sort: type asc, importance desc, id asc (deterministic).
-// ---------------------------------------------------------------------------
-
-function formatPersonaPinned(memories: MemoryApiRecord[]): string {
-  return memories
-    .map((m) => ({ ...m, content: sanitizeMemoryContent(m.content) }))
-    .filter((m) => m.content)
-    .map((m) => `- [${m.type}][importance=${m.importance.toFixed(2)}] ${m.content}`)
-    .join("\n");
-}
-
-const personaPinnedBlock: Block = {
-  id: "persona_pinned",
-  kind: "stable",
-  role: "system",
-  cache_anchor: false,
-  content_fn: (ctx: AssemblerContext): string | null => {
-    const personaMemories = ctx.pinnedPersonaMemories ?? [];
-    const preciousMemories = ctx.boot?.precious.map((p) => ({
-      id: p.id,
-      namespace: "",
-      type: "precious",
-      content: p.content,
-      summary: null,
-      importance: 1,
-      confidence: 1,
-      status: "active",
-      pinned: true,
-      tags: [],
-      source: "precious",
-      source_message_ids: [],
-      vector_id: null,
-      last_recalled_at: null,
-      recall_count: 0,
-      created_at: p.created_at,
-      updated_at: p.created_at,
-      expires_at: null,
-      fact_key: null,
-      supersedes_id: null,
-      superseded_by_id: null,
-      review_reason: null,
-      valid_as_of: null,
-      last_seen_at: null,
-      seen_count: 0,
-      last_injected_at: null,
-      score: undefined,
-    })) ?? [];
-    const all = [...personaMemories, ...preciousMemories];
-    if (all.length === 0) return null;
-
-    const sorted = [...all].sort((a, b) => {
-      const typeCmp = a.type.localeCompare(b.type);
-      if (typeCmp !== 0) return typeCmp;
-      if (b.importance !== a.importance) return b.importance - a.importance;
-      return a.id.localeCompare(b.id);
-    });
-
-    const text = formatPersonaPinned(sorted);
-    return text || null;
-  },
-};
-
-// ---------------------------------------------------------------------------
-// Block 3: preset_lite (stable)
+// Block 2: preset_lite (stable)
 // Fixed string from plan §5.1, ≤300 chars, hardcoded constant.
 // ---------------------------------------------------------------------------
 
@@ -175,25 +86,7 @@ const presetLiteBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 3.5: boot_stable (stable)
-// v2 boot package: digest + yesterday_log + glossary.
-// Sits before cache anchor — stable content that rarely changes.
-// ---------------------------------------------------------------------------
-
-const bootStableBlock: Block = {
-  id: "boot_stable",
-  kind: "stable",
-  role: "system",
-  cache_anchor: false,
-  content_fn: (ctx: AssemblerContext): string | null => {
-    if (!ctx.boot) return null;
-    const text = formatBootStable(ctx.boot);
-    return text || null;
-  },
-};
-
-// ---------------------------------------------------------------------------
-// Block 4: client_system (stable, cache_anchor = true)
+// Block 3: client_system (stable)
 // Frontend system messages concatenated.
 // ---------------------------------------------------------------------------
 
@@ -275,7 +168,7 @@ const clientSystemBlock: Block = {
   id: "client_system",
   kind: "stable",
   role: "system",
-  cache_anchor: true,
+  cache_anchor: false,
   content_fn: (ctx: AssemblerContext): string | null => {
     const { stable } = splitClientSystemTexts(extractSystemTexts(ctx.systemMessages));
     if (stable.length === 0) return null;
@@ -284,14 +177,100 @@ const clientSystemBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 4.5: client_volatile_context (dynamic)
-// Frontend time/date lines split out of client_system so they do not poison
-// the stable Claude prompt-cache anchor.
+// Block 4: persona_pinned (stable, cache_anchor = true)
+// Pinned memories where type ∈ {persona, identity}, plus boot precious.
+// Sort: type asc, importance desc, id asc (deterministic).
+// First Anthropic explicit-cache system breakpoint (after constants + client_system).
+// ---------------------------------------------------------------------------
+
+function formatPersonaPinned(memories: MemoryApiRecord[]): string {
+  return memories
+    .map((m) => ({ ...m, content: sanitizeMemoryContent(m.content) }))
+    .filter((m) => m.content)
+    .map((m) => `- [${m.type}][importance=${m.importance.toFixed(2)}] ${m.content}`)
+    .join("\n");
+}
+
+const personaPinnedBlock: Block = {
+  id: "persona_pinned",
+  kind: "stable",
+  role: "system",
+  cache_anchor: true,
+  content_fn: (ctx: AssemblerContext): string | null => {
+    const personaMemories = ctx.pinnedPersonaMemories ?? [];
+    const preciousMemories = ctx.boot?.precious.map((p) => ({
+      id: p.id,
+      namespace: "",
+      type: "precious",
+      content: p.content,
+      summary: null,
+      importance: 1,
+      confidence: 1,
+      status: "active",
+      pinned: true,
+      tags: [],
+      source: "precious",
+      source_message_ids: [],
+      vector_id: null,
+      last_recalled_at: null,
+      recall_count: 0,
+      created_at: p.created_at,
+      updated_at: p.created_at,
+      expires_at: null,
+      fact_key: null,
+      supersedes_id: null,
+      superseded_by_id: null,
+      review_reason: null,
+      valid_as_of: null,
+      last_seen_at: null,
+      seen_count: 0,
+      last_injected_at: null,
+      score: undefined,
+    })) ?? [];
+    const all = [...personaMemories, ...preciousMemories];
+    if (all.length === 0) return null;
+
+    const sorted = [...all].sort((a, b) => {
+      const typeCmp = a.type.localeCompare(b.type);
+      if (typeCmp !== 0) return typeCmp;
+      if (b.importance !== a.importance) return b.importance - a.importance;
+      return a.id.localeCompare(b.id);
+    });
+
+    const text = formatPersonaPinned(sorted);
+    return text || null;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Block 5: boot_stable (stable, cache_anchor = true)
+// v2 boot package: impressions ladder + glossary.
+// Second Anthropic explicit-cache system breakpoint — changes daily, so it
+// sits after persona_pinned and forms its own cached prefix tier.
+// When content_fn returns null the block is skipped (single-anchor fallback).
+// ---------------------------------------------------------------------------
+
+const bootStableBlock: Block = {
+  id: "boot_stable",
+  kind: "stable",
+  role: "system",
+  cache_anchor: true,
+  content_fn: (ctx: AssemblerContext): string | null => {
+    if (!ctx.boot) return null;
+    const text = formatBootStable(ctx.boot);
+    return text || null;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Block 5.5: client_volatile_context (turn_context)
+// Frontend time/date lines split out of client_system; injected into the
+// message stream before current_user so they do not poison the cache prefix.
 // ---------------------------------------------------------------------------
 
 const clientVolatileContextBlock: Block = {
   id: "client_volatile_context",
-  kind: "dynamic",
+  kind: "turn_context",
   role: "system",
   cache_anchor: false,
   content_fn: (ctx: AssemblerContext): string | null => {
@@ -307,7 +286,7 @@ const clientVolatileContextBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 5: dynamic_memory_patch (dynamic)
+// Block 5: dynamic_memory_patch (turn_context)
 // Current RAG hits, tagged <memories>...</memories>.
 // ---------------------------------------------------------------------------
 
@@ -327,7 +306,7 @@ function formatRagMemories(memories: MemoryApiRecord[]): string {
 
 const dynamicMemoryPatchBlock: Block = {
   id: "dynamic_memory_patch",
-  kind: "dynamic",
+  kind: "turn_context",
   role: "system",
   cache_anchor: false,
   content_fn: (ctx: AssemblerContext): string | null => {
@@ -337,13 +316,13 @@ const dynamicMemoryPatchBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 6: vision_context (dynamic)
+// Block 6: vision_context (turn_context)
 // Vision assistant output; only when image present + main model non-multimodal.
 // ---------------------------------------------------------------------------
 
 const visionContextBlock: Block = {
   id: "vision_context",
-  kind: "dynamic",
+  kind: "turn_context",
   role: "system",
   cache_anchor: false,
   content_fn: (ctx: AssemblerContext): string | null => {
@@ -418,13 +397,18 @@ if (ALL_BLOCKS.length !== BLOCK_MAP.size) {
 // assemble() — deterministic prompt assembly
 // ---------------------------------------------------------------------------
 
+const TURN_CONTEXT_ID_SET = new Set<string>(TURN_CONTEXT_BLOCK_IDS);
+
 /**
  * Assemble a prompt from blocks + context.
  *
- * - stable/dynamic blocks → system_blocks (with optional cache_control)
+ * - stable blocks → system_blocks (with optional cache_control)
+ * - turn_context blocks → single user message before current_user (message stream)
  * - passthrough blocks → messages (original content preserved)
  * - null content_fn → block skipped
- * - anchor_index points to the position of client_system in system_blocks
+ * - anchor_index = persona_pinned's system_blocks index when that block is
+ *   enabled; otherwise -1 (boot_stable alone must not occupy anchor_index)
+ * - all cache_anchor blocks emit system breakpoints (persona_pinned, boot_stable, …)
  * - client_system_hash is a deterministic hash of the client_system text
  *
  * Determinism: block order is fixed by BLOCK_ORDER array, never Map iteration.
@@ -433,14 +417,14 @@ export function assemble(ctx: AssemblerContext): AssembledPrompt {
   const systemBlocks: SystemBlock[] = [];
   const messages: Array<{ role: "user" | "assistant"; content: string | unknown[] | null }> = [];
   const enabledBlockIds: string[] = [];
-  let anchorIndex = -1;
+  const turnContextParts: string[] = [];
+  const anchorIndices: number[] = [];
+  let personaPinnedIndex = -1;
+  let clientSystemText: string | null = null;
 
   for (const block of ALL_BLOCKS) {
     if (block.kind === "passthrough") {
-      // Passthrough blocks route to messages with original content preserved.
       if (block.id === "recent_history") {
-        // Strip <thinking> tags from historical messages before they enter
-        // the assembled prompt. Current user message is NEVER touched.
         const cleanedHistory = preprocessHistory(ctx.historyMessages);
         let added = false;
         for (const msg of cleanedHistory) {
@@ -451,19 +435,19 @@ export function assemble(ctx: AssemblerContext): AssembledPrompt {
           }
         }
         if (added) enabledBlockIds.push(block.id);
-      } else if (block.id === "current_user") {
-        if (ctx.currentUserMessage) {
-          const out = messageToOutput(ctx.currentUserMessage);
-          if (out) {
-            messages.push(out);
-            enabledBlockIds.push(block.id);
-          }
-        }
       }
       continue;
     }
 
-    // Stable / dynamic blocks → system_blocks
+    if (block.kind === "turn_context") {
+      const text = block.content_fn(ctx);
+      if (text !== null) {
+        turnContextParts.push(text);
+        enabledBlockIds.push(block.id);
+      }
+      continue;
+    }
+
     const text = block.content_fn(ctx);
     if (text === null) continue;
 
@@ -471,43 +455,83 @@ export function assemble(ctx: AssemblerContext): AssembledPrompt {
 
     if (block.cache_anchor) {
       systemBlock.cache_control = { type: "ephemeral", ttl: "5m" };
-      anchorIndex = systemBlocks.length;
+      anchorIndices.push(systemBlocks.length);
+      if (block.id === "persona_pinned") {
+        personaPinnedIndex = systemBlocks.length;
+      }
+    }
+
+    if (block.id === "client_system") {
+      clientSystemText = text;
     }
 
     systemBlocks.push(systemBlock);
     enabledBlockIds.push(block.id);
   }
 
-  // client_system_hash: deterministic hash of the client_system block text
-  let clientSystemHash = "none";
-  for (let i = 0; i < systemBlocks.length; i++) {
-    if (enabledBlockIds[i] === "client_system") {
-      clientSystemHash = simpleHash(systemBlocks[i].text);
-      break;
+  // Backward-compatible: only persona_pinned owns anchor_index; boot_stable alone → -1
+  const anchorIndex = personaPinnedIndex;
+  const breakpoints = computeCacheBreakpoints(messages, anchorIndices);
+
+  let turnContextMessageIndex: number | null = null;
+  const turnContextText = turnContextParts.join("\n\n").trim();
+  if (turnContextText) {
+    if (!ctx.currentUserMessage) {
+      console.error(
+        "[assembler] skipping turn_context injection: no current_user message"
+      );
+      for (const id of TURN_CONTEXT_BLOCK_IDS) {
+        const idx = enabledBlockIds.indexOf(id);
+        if (idx >= 0) enabledBlockIds.splice(idx, 1);
+      }
+    } else {
+      turnContextMessageIndex = messages.length;
+      messages.push({ role: "user", content: turnContextText });
     }
   }
 
-  // --- Cache breakpoints (up to 4 for Anthropic) ---
-  //
-  // Anthropic prompt caching works on the full prefix: tools → system → messages.
-  // Each breakpoint marks a position; everything before it is cached.
-  // Each looks back up to 20 content blocks for a previous cache entry.
-  //
-  // Breakpoint 1 (tools): applied in adapter if tool definitions are stable.
-  // Breakpoint 2 (system): persona_pinned — the most stable content.
-  // Breakpoint 3 (bridge): mid-history for long conversations (>16 blocks),
-  //   so the tail anchor's 20-block lookback doesn't lose older cached prefix.
-  // Breakpoint 4 (tail): last stable block before dynamic content.
-  //   Mode A (default): last block of the message before current_user.
-  //   Mode B: first text block of current_user (opt-in).
-  //
-  // Dynamic content (memories, time reminders) is appended AFTER all
-  // breakpoints and never gets cache_control.
-  const LOOKBACK = 16; // Conservative margin (Anthropic allows 20)
+  if (ctx.currentUserMessage) {
+    const out = messageToOutput(ctx.currentUserMessage);
+    if (out) {
+      messages.push(out);
+      enabledBlockIds.push("current_user");
+    }
+  }
+
+  assertCacheSafePlacement(
+    systemBlocks,
+    breakpoints,
+    turnContextMessageIndex,
+    enabledBlockIds
+  );
+
+  const clientSystemHash = clientSystemText ? simpleHash(clientSystemText) : "none";
+
+  return {
+    system_blocks: systemBlocks,
+    messages,
+    meta: {
+      anchor_index: anchorIndex,
+      block_ids: enabledBlockIds,
+      client_system_hash: clientSystemHash,
+      cache_breakpoints: breakpoints,
+    },
+  };
+}
+
+/**
+ * Compute message-level cache breakpoints from history messages only.
+ * Turn-context and current_user are excluded so breakpoints never land on
+ * per-turn dynamic content.
+ */
+function computeCacheBreakpoints(
+  historyMessages: Array<{ role: "user" | "assistant"; content: string | unknown[] | null }>,
+  anchorIndices: number[]
+): CacheBreakpoint[] {
+  const LOOKBACK = 16;
   const breakpoints: CacheBreakpoint[] = [];
 
-  // Breakpoint 2: system anchor on persona_pinned
-  if (anchorIndex >= 0) {
+  for (const anchorIndex of anchorIndices) {
     breakpoints.push({
       target: "system",
       system_block_index: anchorIndex,
@@ -515,17 +539,12 @@ export function assemble(ctx: AssemblerContext): AssembledPrompt {
     });
   }
 
-  // Message-level breakpoints: bridge + tail
-  // Count content blocks in each message for 20-block lookback spacing
-  const msgBlockCounts = messages.map((m) => countMessageBlocks(m.content));
+  const msgBlockCounts = historyMessages.map((m) => countMessageBlocks(m.content));
 
-  // tailIdx: message to place the tail breakpoint on.
-  // Default (mode A): second-to-last message (last history msg before current user).
-  // If only 1 message and mode A: no tail (system anchor covers the prefix).
   let tailIdx = -1;
   let tailBlockIdx = -1;
-  if (messages.length >= 2) {
-    tailIdx = messages.length - 2;
+  if (historyMessages.length >= 1) {
+    tailIdx = historyMessages.length - 1;
     tailBlockIdx = Math.max(0, msgBlockCounts[tailIdx] - 1);
   }
 
@@ -537,15 +556,10 @@ export function assemble(ctx: AssemblerContext): AssembledPrompt {
       reason: "tail",
     });
 
-    // bridge: if total message blocks before the tail message is > LOOKBACK,
-    // place a bridge anchor ~LOOKBACK blocks before the tail to keep the
-    // cache chain connected across long conversations.
     let blocksBeforeTail = 0;
     for (let i = 0; i < tailIdx; i++) blocksBeforeTail += msgBlockCounts[i];
 
     if (blocksBeforeTail > LOOKBACK) {
-      // Walk backward from tailIdx to find the message containing
-      // the block at position (blocksBeforeTail - LOOKBACK)
       let target = blocksBeforeTail - LOOKBACK;
       let accumulated = 0;
       let bridgeMsgIdx = 0;
@@ -558,7 +572,6 @@ export function assemble(ctx: AssemblerContext): AssembledPrompt {
         }
         accumulated += msgBlockCounts[i];
       }
-      // Don't add bridge if it would be the same as tail
       if (bridgeMsgIdx !== tailIdx || bridgeBlockIdx !== tailBlockIdx) {
         breakpoints.push({
           target: "message",
@@ -570,16 +583,65 @@ export function assemble(ctx: AssemblerContext): AssembledPrompt {
     }
   }
 
-  return {
-    system_blocks: systemBlocks,
-    messages,
-    meta: {
-      anchor_index: anchorIndex,
-      block_ids: enabledBlockIds,
-      client_system_hash: clientSystemHash,
-      cache_breakpoints: breakpoints,
-    },
-  };
+  return breakpoints;
+}
+
+function assertCacheSafePlacement(
+  systemBlocks: SystemBlock[],
+  breakpoints: CacheBreakpoint[],
+  turnContextMessageIndex: number | null,
+  enabledBlockIds: string[]
+): void {
+  const violations: string[] = [];
+
+  for (const block of systemBlocks) {
+    if (
+      block.text.includes("<volatile_context>") ||
+      block.text.includes("<vision_context>") ||
+      /(^|\n)<memories>/.test(block.text)
+    ) {
+      violations.push("per-turn dynamic content found in system_blocks");
+      break;
+    }
+  }
+
+  const hasTurnContext = enabledBlockIds.some((id) => TURN_CONTEXT_ID_SET.has(id));
+  if (hasTurnContext && turnContextMessageIndex == null) {
+    violations.push("turn_context blocks enabled but no turn-context message was injected");
+  }
+
+  if (turnContextMessageIndex != null) {
+    for (const bp of breakpoints) {
+      if (
+        bp.target === "message" &&
+        bp.message_index != null &&
+        bp.message_index >= turnContextMessageIndex
+      ) {
+        violations.push(
+          `cache breakpoint "${bp.reason}" at message_index ${bp.message_index} is on or after turn_context at ${turnContextMessageIndex}`
+        );
+      }
+    }
+  }
+
+  // Assembler self-check only: counts system + bridge + tail from this module.
+  // Does NOT include the tools breakpoint added later by anthropicAdapter.
+  // Wire-level ≤4 guarantee (system + tools + messages) is enforced in
+  // buildAnthropicRequestFromAssembled via budgetMessageBreakpoints.
+  // Worst case here: 2 system (persona_pinned + boot_stable) + bridge + tail = 4.
+  if (breakpoints.length > 4) {
+    violations.push(`cache breakpoints exceed Anthropic limit of 4 (got ${breakpoints.length})`);
+  }
+
+  if (violations.length === 0) return;
+
+  const message = `[assembler] cache-safe placement violated: ${violations.join("; ")}`;
+  const nodeEnv = (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env
+    ?.NODE_ENV;
+  if (nodeEnv !== undefined && nodeEnv !== "production") {
+    throw new Error(message);
+  }
+  console.error(message);
 }
 
 /**

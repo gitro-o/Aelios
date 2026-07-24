@@ -1,5 +1,6 @@
 import type { Env, MemoryApiRecord, MemoryRecord } from "../types";
 import { newId } from "../utils/ids";
+import { clampScore, parseStringArray, readString } from "../utils/parse";
 import { nowIso } from "../utils/time";
 import { createEmbedding } from "./embedding";
 import { clampMemoryType } from "./canonicalTypes";
@@ -58,30 +59,8 @@ export interface VectorMemoryListPage {
   totalCount?: number;
 }
 
-function clampScore(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : fallback;
-}
-
-function readString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
 function readBoolean(value: unknown): boolean {
   return value === true || value === "true" || value === 1;
-}
-
-function parseStringArray(value: unknown): string[] {
-  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
-  if (typeof value !== "string" || !value.trim()) return [];
-
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (Array.isArray(parsed)) return parseStringArray(parsed);
-  } catch {
-    // Plain metadata strings are also valid single tags.
-  }
-
-  return [value.trim()];
 }
 
 function toMetadata(input: Required<VectorMemoryInput> & { id: string; vectorId: string; createdAt: string; updatedAt: string; status?: string }): Record<string, VectorizeVectorMetadata> {
@@ -267,13 +246,13 @@ async function getVectorsByIdsBatched(
   vectorize: Vectorize | VectorizeIndex,
   ids: string[]
 ): Promise<VectorizeVector[]> {
-  const vectors: VectorizeVector[] = [];
-
+  const batchPromises: Promise<VectorizeVector[]>[] = [];
   for (let index = 0; index < ids.length; index += 20) {
-    vectors.push(...(await vectorize.getByIds(ids.slice(index, index + 20))));
+    batchPromises.push(vectorize.getByIds(ids.slice(index, index + 20)));
   }
-
-  return vectors;
+  const batches = await Promise.all(batchPromises);
+  // Flatten preserving batch order (Promise.all keeps input order).
+  return batches.flat();
 }
 
 function candidateVectorIds(id: string): string[] {
@@ -391,7 +370,16 @@ export async function createVectorMemory(env: Env, input: VectorMemoryInput): Pr
   return memoryRecordToApiRecord(record);
 }
 
-export async function getVectorMemory(env: Env, id: string): Promise<MemoryApiRecord | null> {
+export async function getVectorMemory(
+  env: Env,
+  id: string,
+  options?: { requireD1Backing?: boolean }
+): Promise<MemoryApiRecord | null> {
+  if (options?.requireD1Backing) {
+    const d1Record = await getMemoryRecordById(env, id);
+    return d1Record ? memoryRecordToApiRecord(d1Record) : null;
+  }
+
   const vectorIds = candidateVectorIds(id);
   const vectors = vectorIds.length > 0 ? await requireVectorize(env).getByIds(vectorIds) : [];
 
@@ -411,42 +399,6 @@ export async function deleteVectorMemory(env: Env, id: string): Promise<boolean>
 
   if (existing) {
     await markMemoryRecordDeleted(env, { namespace: existing.namespace, id: existing.id, updatedAt: nowIso() });
-  }
-
-  if (existing?.vector_id) {
-    const vector = await createEmbedding(env, existing.content);
-    if (vector) {
-      const updatedAt = nowIso();
-      try {
-        await requireVectorize(env).upsert([
-          {
-            id: existing.vector_id,
-            namespace: existing.namespace,
-            values: vector,
-            metadata: toMetadata({
-              namespace: existing.namespace,
-              type: existing.type,
-              content: existing.content,
-              summary: existing.summary ?? null,
-              importance: existing.importance,
-              confidence: existing.confidence,
-              pinned: existing.pinned,
-              tags: existing.tags,
-              source: existing.source ?? null,
-              sourceMessageIds: existing.source_message_ids,
-              expiresAt: existing.expires_at ?? null,
-              id: existing.id,
-              vectorId: existing.vector_id,
-              createdAt: existing.created_at,
-              updatedAt,
-              status: "deleted"
-            })
-          }
-        ]);
-      } catch (error) {
-        console.error("memory vector tombstone upsert failed after D1 delete", { id: existing.id, error });
-      }
-    }
   }
 
   if (vectorIds.length > 0) {
@@ -470,11 +422,30 @@ export async function updateVectorMemory(
   const content = (patch.content ?? existing.content).trim();
   if (!content) return null;
 
-  const vector = await createEmbedding(env, content);
-  if (!vector) throw new Error("Failed to create embedding");
-
   const updatedAt = nowIso();
   const vectorId = existing.vector_id || (id.startsWith("mem_") ? id : `mem_${id}`);
+
+  // Metadata-only patches: skip re-embedding; reuse existing Vectorize values.
+  // Vectorize upsert requires values, so fetch via getByIds; fall back to re-embed if missing.
+  const contentUnchanged =
+    patch.content === undefined || patch.content.trim() === existing.content;
+  let vector: number[] | null = null;
+  if (contentUnchanged) {
+    try {
+      const existingVectors = await requireVectorize(env).getByIds([vectorId]);
+      const values = existingVectors[0]?.values;
+      if (values && values.length > 0) {
+        vector = Array.from(values);
+      }
+    } catch (error) {
+      console.error("memory vector getByIds failed; will re-embed", { id, error });
+    }
+  }
+  if (!vector) {
+    vector = await createEmbedding(env, content);
+    if (!vector) throw new Error("Failed to create embedding");
+  }
+
   const next = {
     namespace: existing.namespace,
     type: patch.type ?? existing.type,
@@ -554,17 +525,20 @@ export async function searchVectorMemories(
 
   const topK = Math.min(Math.max(Math.floor(input.topK), 1), 50);
   const vectorize = requireVectorize(env);
-  const namespacedResult = await vectorize.query(vector, {
-    topK,
-    namespace: input.namespace,
-    returnMetadata: "all",
-    filter
-  });
-
-  const legacyResult = await vectorize.query(vector, {
-    topK,
-    returnMetadata: "all"
-  });
+  // Always run both queries: merge semantics take max score across result sets.
+  // Do not gate legacy on empty namespaced results.
+  const [namespacedResult, legacyResult] = await Promise.all([
+    vectorize.query(vector, {
+      topK,
+      namespace: input.namespace,
+      returnMetadata: "all",
+      filter
+    }),
+    vectorize.query(vector, {
+      topK,
+      returnMetadata: "all"
+    })
+  ]);
 
   const matchesByVectorId = new Map<string, VectorizeMatch>();
   for (const match of [...namespacedResult.matches, ...legacyResult.matches]) {
@@ -592,7 +566,7 @@ export async function searchVectorMemories(
     .slice(0, topK);
 }
 
-async function listVectorIdsViaApi(
+export async function listVectorIdsViaApi(
   env: Env,
   input: VectorMemoryListInput
 ): Promise<{ ids: string[]; cursor: string | null; hasMore: boolean; totalCount?: number }> {

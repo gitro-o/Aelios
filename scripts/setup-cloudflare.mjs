@@ -15,7 +15,7 @@ const vectorizeName =
   process.env.CMP_VECTORIZE_NAME || readVectorizeValue("index_name") || "memo-kb";
 const vectorizeBinding =
   process.env.CMP_VECTORIZE_BINDING || readVectorizeValue("binding") || "VECTORIZE";
-const vectorizeDimensions = process.env.CMP_VECTORIZE_DIMENSIONS || "768";
+const vectorizeDimensions = process.env.CMP_VECTORIZE_DIMENSIONS || "1024";
 const vectorizeMetric = process.env.CMP_VECTORIZE_METRIC || "cosine";
 const queueName = process.env.CMP_QUEUE_NAME || "companion-memory";
 // Variables that are safe to persist as visible Worker config in wrangler.toml
@@ -28,7 +28,6 @@ const visibleVarNames = [
   "CHAT_MODEL",
   "VECTORIZE_INDEX_NAME",
   "ENABLE_MEMORY_RERANKER",
-  "MEMORY_FILTER_MODEL",
   "MEMORY_RERANKER_MODEL",
   "MEMORY_FILTER_MAX_CANDIDATES",
   "MEMORY_FILTER_MAX_OUTPUT",
@@ -46,12 +45,6 @@ const visibleVarNames = [
   "DREAM_MAX_RUNS",
   "DREAM_MAX_TOKENS",
   "DREAM_MEMORY_CONTEXT_LIMIT",
-  "DREAM_EXCERPT_LIMIT",
-  "EXTRACT_MODEL",
-  "EXTRACT_MAX_MESSAGES",
-  "EXTRACT_MAX_RUNS",
-  "EXTRACT_MAX_TOKENS",
-  "EXTRACT_REVIEW_CONFIDENCE",
   "DEDUP_COSINE",
   "ANTHROPIC_THINKING_ENABLED",
   "ANTHROPIC_THINKING_BUDGET",
