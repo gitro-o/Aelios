@@ -297,11 +297,16 @@ async function handleRecallMemories(request: Request, env: Env, profile: KeyProf
       score: d.score
     }));
     const patch = formatMemoryPatch(promptRecords);
-    if (result.glossary_hits.length > 0) {
-      const glossaryLines = result.glossary_hits.map(
-        (g) => `- [glossary] ${g.term}: ${g.definition}`
-      );
-      prompt = patch ? `${patch}\n${glossaryLines.join("\n")}` : glossaryLines.join("\n");
+    const extraLines = [
+      ...result.glossary_hits.map((g) => `- [glossary] ${g.term}: ${g.definition}`),
+      // #35: 周块跟命中平行注入。标出周次和起止日期，让模型知道这是那一整段时间的概貌，
+      // 不是又一条碎片。
+      ...result.week_blocks.map(
+        (b) => `- [周记 ${b.week} ${b.start_date}~${b.end_date}] ${b.title}：${b.summary}`
+      )
+    ];
+    if (extraLines.length > 0) {
+      prompt = patch ? `${patch}\n${extraLines.join("\n")}` : extraLines.join("\n");
     } else {
       prompt = patch || undefined;
     }
@@ -309,12 +314,15 @@ async function handleRecallMemories(request: Request, env: Env, profile: KeyProf
 
   return json({
     data,
+    // #35: 周块与 data 平行下发，不混进 data —— 它是上下文块，不是命中。
+    week_blocks: result.week_blocks,
     meta: {
       namespace,
       backend: "v2-recall",
       top_k: k,
       count: data.length,
       glossary_hits: result.glossary_hits.length,
+      week_block_count: result.week_blocks.length,
       ...result.meta
     },
     ...(prompt ? { prompt } : {})

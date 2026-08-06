@@ -40,6 +40,10 @@ export interface Env {
   RECALL_MIN_SCORE?: string;
   // true = 丢弃没有有效 D1 记录背书的 Vectorize 命中 (清理 legacy 孤儿向量)，默认 false 保持现状。
   RECALL_REQUIRE_D1_BACKING?: string;
+  // #35 周块附带：命中记忆所在那一周的 weekly_log 整块随召回下发。默认开，"false" 关。
+  RECALL_WEEK_BLOCKS?: string;
+  // 一次召回最多附带几块周记，默认 2。块是上下文不是命中，不占 k 的名额。
+  RECALL_WEEK_BLOCK_LIMIT?: string;
   // LMC-5 Y 轴: 2-hop relation expansion. Default off (undefined/"off"/"false") = recall identical to pre-LMC5.
   // Set "on" or "true" to enable hop1/hop2 expansion after vector seed hits.
   RELATION_EXPANSION?: string;

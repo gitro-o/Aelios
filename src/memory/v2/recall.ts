@@ -17,10 +17,12 @@ import {
   listGlossary,
   listRecentMonthlyLogs,
   listRecentWeeklyLogs,
+  getWeeklyLog,
   fetchLongtailByIds,
   matchGlossary,
   markMemoriesInjected
 } from "../../db/v2";
+import { getIsoWeekLabelForDateLabel } from "../weeklyRollup";
 import { searchMemoriesWithProvenance } from "../search";
 import type { MemoryApiRecordWithProvenance } from "../search";
 import { filterAndCompressMemories } from "../filter";
@@ -50,6 +52,35 @@ function injectDecayFactor(env: Env): number {
 function readRecallMinScore(env: Env, override?: number): number {
   const raw = override ?? Number(env.RECALL_MIN_SCORE ?? 0.15);
   return Number.isFinite(raw) ? Math.min(Math.max(raw, 0), 1) : 0.15;
+}
+
+// --- 周块附带 (#35，过渡方案) ---
+// 病：召回出来全是原子碎片，没有宏观上下文。weekly_log 本身已经是聚好的、
+// 可读的、带时间范围的块，但只有显式 diary_get 拿得到。
+//
+// 与 embedding.ts 的隔离不变量的关系：那条不变量禁的是「daily/weekly/monthly_log
+// 永不 embed、永不进检索通道」。这里不 embed、不查向量、不混进 hits 数组，
+// 走的是命中之后按周 join 取整块，属于附带上下文，不是检索结果。
+// 所以周块必须留在 week_blocks 字段里，谁都不许把它 push 进 hits。
+//
+// 二档 scenarios 表上线后，取值源换成真正的场景块，这段整体退役。
+function isWeekBlockEnabled(env: Env): boolean {
+  return env.RECALL_WEEK_BLOCKS !== "false";
+}
+function weekBlockLimit(env: Env): number {
+  const n = Number(env.RECALL_WEEK_BLOCK_LIMIT);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 2;
+}
+
+function dateLabelInTimeZone(iso: string, timeZone: string): string | null {
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return null;
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date(ts));
 }
 
 function decayForLastInjected(
@@ -301,9 +332,22 @@ export interface RecallHit {
   contradicted_by?: string[];
 }
 
+// #35: 命中记忆所在那一周的 weekly_log 整块。跟 hits 平行，不参与 min_score 过滤，
+// 不占 k 的名额 —— 它是上下文，不是命中。
+export interface RecallWeekBlock {
+  week: string;
+  start_date: string;
+  end_date: string;
+  title: string;
+  summary: string;
+  // 哪几条命中把这一周带出来的，供面板追溯，也方便二档迁移时对照。
+  seed_ids: string[];
+}
+
 export interface RecallResult {
   hits: RecallHit[];
   glossary_hits: Array<{ term: string; definition: string }>;
+  week_blocks: RecallWeekBlock[];
   meta: {
     decayed_ids: string[];
     deduped_ids: string[];
@@ -326,6 +370,7 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     return {
       hits: [],
       glossary_hits: [],
+      week_blocks: [],
       meta: {
         decayed_ids: [], deduped_ids: [], floored_ids: [], floored_count: 0, min_score: minScore, total: 0,
         unbacked_count: 0, unbacked_dropped: 0
@@ -366,9 +411,14 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
   const windowMs = injectDecayWindowMs(env);
   const factor = injectDecayFactor(env);
   const decayedIds: string[] = [];
+  // #35: 记下每条命中的事实时间，末尾按周取块用。valid_as_of 是事实生效时间，
+  // 比入库时间准；没有才退回 created_at。
+  const timeByMemoryId = new Map<string, string>();
   const scored: RecallHit[] = memories.map((m) => {
     const decay = decayForLastInjected(m.last_injected_at ?? null, windowMs, factor);
     if (decay < 1) decayedIds.push(m.id);
+    const factTime = m.valid_as_of ?? m.created_at;
+    if (factTime) timeByMemoryId.set(m.id, factTime);
     return {
       id: m.id,
       content: m.content,
@@ -454,9 +504,26 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     }
   }
 
+  // 7. #35 周块附带。失败不影响召回主体，吞掉记日志。
+  let weekBlocks: RecallWeekBlock[] = [];
+  if (isWeekBlockEnabled(env) && allHits.length > 0) {
+    try {
+      weekBlocks = await collectWeekBlocks(env, {
+        namespace: input.namespace,
+        hits: allHits,
+        timeByMemoryId,
+        decayedIds: new Set(decayedIds)
+      });
+    } catch (error) {
+      console.error("v2 week block attach failed", error);
+      weekBlocks = [];
+    }
+  }
+
   return {
     hits: allHits,
     glossary_hits: glossaryHits,
+    week_blocks: weekBlocks,
     meta: {
       decayed_ids: decayedIds,
       deduped_ids: dedupedIds,
@@ -468,6 +535,66 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
       unbacked_dropped: unbackedDropped
     }
   };
+}
+
+// #35 周块附带。把命中记忆按事实时间归到 ISO 周，取那一周的 weekly_log 整块。
+//
+// 两条约束的落法：
+//   闸三延伸 —— weekly_log 表没有 last_injected_at 列，工单也定了不动 schema，
+//   所以周块不自己记账，跟着种子走：种子被闸三降权 (近期注入过) 就不带它的周。
+//   同一块连轮复读因此自动收敛，不需要新列。
+//   与 boot 去重 —— boot 包恒带最近一条 weekly，recall 再带就是同一段文字喂两遍，
+//   所以最近那一周在这里剔掉。
+export async function collectWeekBlocks(
+  env: Env,
+  input: {
+    namespace: string;
+    hits: RecallHit[];
+    timeByMemoryId: Map<string, string>;
+    decayedIds: Set<string>;
+  }
+): Promise<RecallWeekBlock[]> {
+  const timeZone = env.DREAM_TIME_ZONE || "Asia/Shanghai";
+
+  const seedsByWeek = new Map<string, string[]>();
+  for (const hit of input.hits) {
+    if (hit.source_layer !== "memory") continue;
+    if (input.decayedIds.has(hit.id)) continue;
+    const factTime = input.timeByMemoryId.get(hit.id);
+    if (!factTime) continue;
+    const dateLabel = dateLabelInTimeZone(factTime, timeZone);
+    if (!dateLabel) continue;
+    const week = getIsoWeekLabelForDateLabel(dateLabel, timeZone);
+    const seeds = seedsByWeek.get(week);
+    if (seeds) seeds.push(hit.id);
+    else seedsByWeek.set(week, [hit.id]);
+  }
+  if (seedsByWeek.size === 0) return [];
+
+  const [latest] = await listRecentWeeklyLogs(env.DB, { namespace: input.namespace, limit: 1 });
+  if (latest) seedsByWeek.delete(latest.week);
+  if (seedsByWeek.size === 0) return [];
+
+  // 命中多的周排前面；打平了按周从新到旧。
+  const ranked = [...seedsByWeek.entries()]
+    .sort((a, b) => b[1].length - a[1].length || b[0].localeCompare(a[0]))
+    .slice(0, weekBlockLimit(env));
+
+  const rows = await Promise.all(
+    ranked.map(([week]) => getWeeklyLog(env.DB, { namespace: input.namespace, week }))
+  );
+
+  return rows.flatMap((row, i) => {
+    if (!row) return [];
+    return [{
+      week: row.week,
+      start_date: row.start_date,
+      end_date: row.end_date,
+      title: row.title,
+      summary: row.summary,
+      seed_ids: ranked[i][1]
+    }];
+  });
 }
 
 // 长尾兜底: 母帖第六节"只在前面全空时兜底"。
