@@ -6,7 +6,8 @@
  *   1. 命中按事实时间归到 ISO 周，同周聚成一块，seed_ids 记全。
  *   2. 闸三延伸：被降权的种子不带它的周（weekly_log 没有 last_injected_at 列，
  *      工单又定了不动 schema，所以周块跟着种子走）。
- *   3. 与 boot 去重：最近一周剔掉（boot 包恒带它，再带就是同一段文字喂两遍）。
+ *   3. 与 boot 去重靠调用方传 exclude_weeks；这里默认一周都不剔。
+ *      （第一版在这儿写死"剔掉最近一周"，2026-08-07 生产验收当场打脸，见第 3 项。）
  *   4. 隔离不变量：周块不进 hits、不 embed、不查向量。
  *
  * Run:  npx tsx scripts/verify-week-blocks.mjs
@@ -77,7 +78,7 @@ function weekRow(week, start, end, title) {
   };
 }
 
-// 三周素材。W32 是"最近一周"，boot 恒带，应当被剔除。
+// 三周素材。W32 是表里最新的一周，默认应当照常出块（第 3 项钉这条）。
 const ROWS = [
   weekRow("2026-W30", "2026-07-20", "2026-07-26", "第三十周"),
   weekRow("2026-W31", "2026-07-27", "2026-08-02", "第三十一周"),
@@ -130,19 +131,42 @@ function pass(label) {
   pass("闸三延伸：近期注入过的种子不再带它那一周");
 }
 
-// --- 3. 与 boot 去重：最近一周剔除 ---
+// --- 3. 回归：默认不许剔掉最近一周 ---
+// 2026-08-07 生产验收踩的坑：第一版在这儿写死"剔掉最近一周，因为 boot 恒带它"。
+// 但 weekly_log 的滚动落后当前日期一两周，"最近一周"往往正是命中最密的那一周，
+// 而 hook 走的 /v1/memory/recall 根本不调 boot。结果最有用的块被白扔。
 {
   const blocks = await collectWeekBlocks(baseEnv, {
     namespace: NS,
     hits: [hit("d")],
-    timeByMemoryId: new Map([["d", "2026-08-05T12:00:00+08:00"]]), // W32 = 最近一周
+    timeByMemoryId: new Map([["d", "2026-08-05T12:00:00+08:00"]]), // W32 = 表里最新的一周
     decayedIds: new Set()
   });
-  assert.deepEqual(blocks, [], "最近一周由 boot 供给，recall 不重复带");
-  pass("与 boot 去重：最近一周不重复注入");
+  assert.deepEqual(
+    blocks.map((b) => b.week),
+    ["2026-W32"],
+    "没传 exclude_weeks 就不许自作主张剔掉最近一周"
+  );
+  pass("回归：默认不剔最近一周（去重责任在调用方，不在这里猜）");
 }
 
-// --- 4. 配额 ---
+// --- 4. exclude_weeks：调用方点名的周才剔 ---
+{
+  const blocks = await collectWeekBlocks(baseEnv, {
+    namespace: NS,
+    hits: [hit("d"), hit("a")],
+    timeByMemoryId: new Map([
+      ["d", "2026-08-05T12:00:00+08:00"], // W32
+      ["a", "2026-07-28T10:00:00+08:00"]  // W31
+    ]),
+    decayedIds: new Set(),
+    excludeWeeks: ["2026-W32"]
+  });
+  assert.deepEqual(blocks.map((b) => b.week), ["2026-W31"], "点名的 W32 该被剔掉");
+  pass("exclude_weeks：调用方点名的周才剔（boot 那层负责传）");
+}
+
+// --- 5. 配额 ---
 {
   const blocks = await collectWeekBlocks(
     { ...baseEnv, RECALL_WEEK_BLOCK_LIMIT: "1" },
@@ -160,7 +184,7 @@ function pass(label) {
   pass("配额 RECALL_WEEK_BLOCK_LIMIT 生效");
 }
 
-// --- 5. 只认 memory 层命中；longtail 不带周 ---
+// --- 6. 只认 memory 层命中；longtail 不带周 ---
 {
   const longtail = { ...hit("lt1"), source_layer: "longtail", kind: "longtail" };
   const blocks = await collectWeekBlocks(baseEnv, {
@@ -173,7 +197,7 @@ function pass(label) {
   pass("只有 memory 层命中带周块");
 }
 
-// --- 6. 查不到 weekly_log 的周静默跳过 ---
+// --- 7. 查不到 weekly_log 的周静默跳过 ---
 {
   const blocks = await collectWeekBlocks(baseEnv, {
     namespace: NS,
@@ -185,7 +209,7 @@ function pass(label) {
   pass("weekly_log 缺失的周静默跳过，不造空块");
 }
 
-// --- 7. 隔离不变量：周块不进 hits、不碰向量 ---
+// --- 8. 隔离不变量：周块不进 hits、不碰向量 ---
 {
   const src = readFileSync(resolve(root, "src/memory/v2/recall.ts"), "utf8");
   const fnStart = src.indexOf("export async function collectWeekBlocks");

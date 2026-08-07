@@ -308,6 +308,10 @@ export interface RecallInput {
   core_fingerprint?: CoreFingerprint;
   // LMC-5 additive: when true, allow version_status=superseded hits (history). Default false.
   include_history?: boolean;
+  // #35: 调用方已经从别处给了模型哪几周的周记，这里就不重复带。
+  // 同时构建 boot 和 recall 的调用方 (chatCompletions) 应当传 boot 那条 weekly 的 label；
+  // 只调 recall 的调用方 (hook 走 /v1/memory/recall) 不传，否则会白丢最有用的那块。
+  exclude_weeks?: string[];
   // When set (chat hot path), injection accounting is scheduled off the response path.
   waitUntil?: (promise: Promise<unknown>) => void;
 }
@@ -512,7 +516,8 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
         namespace: input.namespace,
         hits: allHits,
         timeByMemoryId,
-        decayedIds: new Set(decayedIds)
+        decayedIds: new Set(decayedIds),
+        excludeWeeks: input.exclude_weeks
       });
     } catch (error) {
       console.error("v2 week block attach failed", error);
@@ -543,8 +548,11 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
 //   闸三延伸 —— weekly_log 表没有 last_injected_at 列，工单也定了不动 schema，
 //   所以周块不自己记账，跟着种子走：种子被闸三降权 (近期注入过) 就不带它的周。
 //   同一块连轮复读因此自动收敛，不需要新列。
-//   与 boot 去重 —— boot 包恒带最近一条 weekly，recall 再带就是同一段文字喂两遍，
-//   所以最近那一周在这里剔掉。
+//   与 boot 去重 —— 交给调用方传 exclude_weeks，这里不自己猜。
+//   第一版我在这儿写死"剔掉最近一周，因为 boot 恒带它"，2026-08-07 生产验收当场打脸：
+//   weekly_log 的滚动比当前日期落后一两周 (daily 满 7 天才 rollup)，所以"最近一周"
+//   往往正是命中最密的那一周；而 hook 走的 /v1/memory/recall 根本不调 boot。
+//   结果是最有用的块被白扔。去重责任属于同时持有 boot 和 recall 的那一层。
 export async function collectWeekBlocks(
   env: Env,
   input: {
@@ -552,6 +560,7 @@ export async function collectWeekBlocks(
     hits: RecallHit[];
     timeByMemoryId: Map<string, string>;
     decayedIds: Set<string>;
+    excludeWeeks?: string[];
   }
 ): Promise<RecallWeekBlock[]> {
   const timeZone = env.DREAM_TIME_ZONE || "Asia/Shanghai";
@@ -571,8 +580,7 @@ export async function collectWeekBlocks(
   }
   if (seedsByWeek.size === 0) return [];
 
-  const [latest] = await listRecentWeeklyLogs(env.DB, { namespace: input.namespace, limit: 1 });
-  if (latest) seedsByWeek.delete(latest.week);
+  for (const week of input.excludeWeeks ?? []) seedsByWeek.delete(week);
   if (seedsByWeek.size === 0) return [];
 
   // 命中多的周排前面；打平了按周从新到旧。
