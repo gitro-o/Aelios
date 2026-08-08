@@ -182,7 +182,7 @@ export async function upsertMemoryByFactKey(
   // version_status=superseded 不参与 upsert 命中（LMC-5）。
   const existing = await db
     .prepare(
-      `SELECT m.id, m.authored_by FROM memories m
+      `SELECT m.id, m.authored_by, m.response_tendency FROM memories m
        LEFT JOIN memory_lifecycle lc ON lc.memory_id = m.id
        WHERE m.namespace = ? AND m.status = 'active'
          AND (m.version_status IS NULL OR m.version_status IN ('current', 'under_review'))
@@ -191,7 +191,7 @@ export async function upsertMemoryByFactKey(
        LIMIT 1`
     )
     .bind(input.namespace, input.factKey, input.factKey)
-    .first<{ id: string; authored_by: string | null }>();
+    .first<{ id: string; authored_by: string | null; response_tendency: string | null }>();
 
   if (existing) {
     // E 轴保护：亲笔记忆不接受蒸馏链改写 (dream/judge 的候选路径可提案，落笔归人)。
@@ -199,7 +199,8 @@ export async function upsertMemoryByFactKey(
       throw new HandAuthoredProtectedError(existing.id);
     }
     // 更新 memories 本体 (v1 列 + LMC-5 fact_key/version_status)。
-    // E 轴两列只在亲手来源时更新；蒸馏链更新一条无主记忆时不碰它们 (保持 null)。
+    // E 轴两列只在亲手来源时更新；不传就继承已有值 (亲手改内容不该抹掉旧署名)，
+    // 与 supersede 的继承原则一致。蒸馏链更新一条无主记忆时不碰它们 (保持 null)。
     await db
       .prepare(
         `UPDATE memories SET content = ?, type = ?, importance = ?, confidence = ?,
@@ -219,7 +220,12 @@ export async function upsertMemoryByFactKey(
         JSON.stringify(input.sourceMessageIds ?? []),
         now,
         input.factKey,
-        ...(handSource ? [eAxis.authoredBy, eAxis.responseTendency] : []),
+        ...(handSource
+          ? [
+              eAxis.authoredBy ?? existing.authored_by,
+              eAxis.responseTendency ?? existing.response_tendency
+            ]
+          : []),
         existing.id
       )
       .run();
@@ -405,7 +411,7 @@ export async function supersedeMemory(
   });
   const old = await db
     .prepare(
-      `SELECT id, status, vector_id, fact_key, type, authored_by FROM memories WHERE namespace = ? AND id = ?`
+      `SELECT id, status, vector_id, fact_key, type, authored_by, response_tendency FROM memories WHERE namespace = ? AND id = ?`
     )
     .bind(input.namespace, input.oldId)
     .first<{
@@ -415,6 +421,7 @@ export async function supersedeMemory(
       fact_key: string | null;
       type: string;
       authored_by: string | null;
+      response_tendency: string | null;
     }>();
 
   // E 轴保护：亲笔记忆不许被蒸馏链 supersede (dream/judge 撞上抛错，各自的 per-item catch 会记失败跳过)。
@@ -504,8 +511,11 @@ export async function supersedeMemory(
     .run();
 
   // 2. 插新条目 (current，继承 fact_key)。
-  //    亲手 supersede 亲笔记忆时，新条 E 轴取显式入参；没传则继承旧条署名 (亲笔链不断)。
+  //    亲手 supersede 亲笔记忆时，新条 E 轴取显式入参；没传则继承旧条 (亲笔链不断，倾向同理)。
   const nextAuthoredBy = handSource ? (eAxis.authoredBy ?? old.authored_by) : null;
+  const nextResponseTendency = handSource
+    ? (eAxis.responseTendency ?? old.response_tendency)
+    : null;
   await db
     .prepare(
       `INSERT INTO memories (
@@ -529,7 +539,7 @@ export async function supersedeMemory(
       now,
       newFactKey,
       nextAuthoredBy,
-      eAxis.responseTendency
+      nextResponseTendency
     )
     .run();
   await db

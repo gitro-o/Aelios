@@ -421,7 +421,7 @@ function createMockD1() {
           const lc = state.lifecycle.get(memoryId);
           return lc ? { fact_key: lc.fact_key ?? null } : null;
         }
-        if (normalized.includes("SELECT id, status, vector_id, fact_key, type, authored_by FROM memories WHERE namespace = ? AND id = ?")) {
+        if (normalized.includes("SELECT id, status, vector_id, fact_key, type, authored_by, response_tendency FROM memories WHERE namespace = ? AND id = ?")) {
           const [namespace, id] = binds;
           const row = getById(id);
           if (!row || row.namespace !== namespace) return null;
@@ -431,13 +431,16 @@ function createMockD1() {
             vector_id: row.vector_id,
             fact_key: row.fact_key,
             type: row.type,
-            authored_by: row.authored_by ?? null
+            authored_by: row.authored_by ?? null,
+            response_tendency: row.response_tendency ?? null
           };
         }
-        if (normalized.includes("SELECT m.id, m.authored_by FROM memories m")) {
+        if (normalized.includes("SELECT m.id, m.authored_by, m.response_tendency FROM memories m")) {
           const [namespace, factKey] = binds;
           const row = findActiveByFactKey(namespace, factKey);
-          return row ? { id: row.id, authored_by: row.authored_by ?? null } : null;
+          return row
+            ? { id: row.id, authored_by: row.authored_by ?? null, response_tendency: row.response_tendency ?? null }
+            : null;
         }
         if (normalized.includes("FROM monthly_log") && normalized.includes("month = ?")) {
           const [namespace, month] = binds;
