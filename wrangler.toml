@@ -48,9 +48,15 @@ VISION_MODEL = "workers-ai/@cf/google/gemma-4-26b-a4b-it"
 # handled by the reranker + compressor, so keep this as a garbage gate only.
 MEMORY_MIN_SCORE = "0.1"
 MEMORY_TOP_K = "50"
-# 闸三降权系数: 命中分×factor 低于 RECALL_MIN_SCORE(0.15) 地板即被压下。
-# 典型命中分 0.85-0.9，0.5 默认压不过地板（0.425>0.15），0.15 才能真正抑制窗口内重复注入 (0.9*0.15=0.135<0.15)。
+# 闸三降权系数 (#37 修正后): 只压排序，不参与 RECALL_MIN_SCORE 地板判定。
+# 修正前 0.15×命中分 ≤ 0.15 地板，30 分钟内注入过的记忆被绝对拉黑 (直接追问也召不回)。
+# 现在 0.15 = 窗口内命中重排到队尾；若它是唯一相关命中照样返回。地板判原始相关性分。
 MEMORY_INJECT_DECAY_FACTOR = "0.15"
+# E 轴: 亲笔记忆 (authored_by 非空) 排序加成，只影响排序不影响地板。"1" 关闭。
+MEMORY_AUTHORED_BOOST = "1.15"
+# 审阅闸: cron 周记落成待审，不顺手删 daily_log；审过走 POST /admin/weekly-approve 亲手删。
+# 设 "true" 恢复旧的一条龙 (生成+落库+删日志，链上无人)。
+WEEKLY_ROLLUP_DELETE_DAILIES = "false"
 MEMORY_RERANKER_MODEL = "workers-ai/@cf/baai/bge-reranker-base"
 VECTORIZE_INDEX_NAME = "memo-kb"
 EMBEDDING_MODEL = "workers-ai/@cf/baai/bge-m3"
@@ -94,3 +100,4 @@ queue = "companion-memory"
 queue = "companion-memory"
 max_batch_size = 10
 max_batch_timeout = 30
+

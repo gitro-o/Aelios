@@ -2,7 +2,7 @@ import { authenticate } from "../../auth/apiKey";
 import { listRecentDailyLogs, listRecentWeeklyLogs } from "../../db/v2";
 import { runDiaryWriter } from "../../memory/diaryWriter";
 import { runMonthlyRollup } from "../../memory/monthlyRollup";
-import { runWeeklyRollup } from "../../memory/weeklyRollup";
+import { approveWeeklyRollup, runWeeklyRollup } from "../../memory/weeklyRollup";
 import type { Env } from "../../types";
 import { json, openAiError } from "../../utils/json";
 import { readBoolean, readJsonObject, readString } from "../../utils/request";
@@ -119,6 +119,33 @@ export async function handleWeeklyRollupAdmin(request: Request, env: Env): Promi
     });
   } catch (error) {
     return json({ ok: false, error: error instanceof Error ? error.message : String(error) }, { status: 500 });
+  }
+}
+
+// 审阅通过 → 亲手删该周日志。周记本体不动 (已由 rollup 落库)。
+export async function handleWeeklyApproveAdmin(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
+  if (!auth.profile.scopes.includes("memory:write")) {
+    return openAiError("Missing required scope: memory:write", 403);
+  }
+
+  const url = new URL(request.url);
+  const body = await readJsonObject(request);
+  if (!body) return openAiError("Request body must be a JSON object", 400);
+
+  const namespace =
+    readString(url.searchParams.get("namespace")) ||
+    readString(body.namespace) ||
+    auth.profile.namespace;
+  const week = readString(body.week);
+  if (!week) return openAiError("week is required (e.g. 2026-W31)", 400);
+
+  try {
+    const result = await approveWeeklyRollup(env, { namespace, week });
+    return json({ data: { namespace, ...result } });
+  } catch (error) {
+    return json({ ok: false, error: error instanceof Error ? error.message : String(error) }, { status: 400 });
   }
 }
 

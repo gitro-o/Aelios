@@ -266,7 +266,10 @@ function getTools(): Array<Record<string, unknown>> {
       name: "memory_upsert",
       description:
         "Assert/update a refined memory by fact_key (no waiting for dream). " +
-        "world_fact also uses this with type='world_fact'.",
+        "world_fact also uses this with type='world_fact'. " +
+        "E-axis: pass authored_by (your signature) + optional response_tendency (one line on how to act " +
+        "when this memory fires) to mark it hand-authored — hand-authored memories rank above distilled " +
+        "ones and are protected from dream/judge overwrite.",
       inputSchema: {
         type: "object",
         properties: {
@@ -278,6 +281,8 @@ function getTools(): Array<Record<string, unknown>> {
           tags: { type: "array", items: { type: "string" } },
           source: { type: "string" },
           valid_as_of: { type: "string" },
+          authored_by: { type: "string", description: "E-axis signature; only honored on hand sources (mcp/manual/api)" },
+          response_tendency: { type: "string", description: "E-axis: how to respond when this memory fires" },
           namespace: { type: "string" }
         },
         required: ["fact_key", "content"]
@@ -297,6 +302,8 @@ function getTools(): Array<Record<string, unknown>> {
           new_fact_key: { type: "string" },
           valid_as_of: { type: "string" },
           reason: { type: "string" },
+          authored_by: { type: "string", description: "E-axis signature for the new entry (hand sources only)" },
+          response_tendency: { type: "string" },
           namespace: { type: "string" }
         },
         required: ["old_id", "new_content"]
@@ -593,18 +600,24 @@ async function callTool(
     const content = readString(args.content);
     if (!factKey) return toolError("fact_key is required");
     if (!content) return toolError("content is required");
-    const result = await upsertMemoryByFactKey(env, {
-      namespace: resolveNamespace(profile, args.namespace),
-      factKey,
-      content,
-      type: readString(args.type) || "fact",
-      importance: readNumber(args.importance, 0.6),
-      confidence: readNumber(args.confidence, 0.8),
-      tags: readStringArray(args.tags),
-      source: readString(args.source) || "mcp",
-      validAsOf: readString(args.valid_as_of)
-    });
-    return textToolResult({ data: result });
+    try {
+      const result = await upsertMemoryByFactKey(env, {
+        namespace: resolveNamespace(profile, args.namespace),
+        factKey,
+        content,
+        type: readString(args.type) || "fact",
+        importance: readNumber(args.importance, 0.6),
+        confidence: readNumber(args.confidence, 0.8),
+        tags: readStringArray(args.tags),
+        source: readString(args.source) || "mcp",
+        validAsOf: readString(args.valid_as_of),
+        authoredBy: readString(args.authored_by) || null,
+        responseTendency: readString(args.response_tendency) || null
+      });
+      return textToolResult({ data: result });
+    } catch (error) {
+      return toolError(error instanceof Error ? error.message : "memory_upsert failed");
+    }
   }
 
   if (params.name === "memory_supersede") {
@@ -622,7 +635,11 @@ async function callTool(
         newType: readString(args.new_type) || "world_fact",
         newFactKey: readString(args.new_fact_key),
         validAsOf: readString(args.valid_as_of),
-        reason: readString(args.reason)
+        reason: readString(args.reason),
+        // MCP 走的是亲手通道：source 记 "mcp"，E 轴字段随之生效 (也能亲手 supersede 亲笔记忆)。
+        source: "mcp",
+        authoredBy: readString(args.authored_by) || null,
+        responseTendency: readString(args.response_tendency) || null
       });
       return textToolResult({ data: result });
     } catch (error) {

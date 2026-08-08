@@ -40,6 +40,10 @@ export function isV2Enabled(env: Env): boolean {
 
 // 闸三: 近期注入过的降权系数。last_injected_at 在窗口内打折扣。
 // 窗口/系数做成 env 可配，不配走默认 (30 分钟 / 0.5)。
+// #37 修正：降权只压排序，不再参与闸四地板判定。修正前 factor(0.15)×命中分 ≤ 地板(0.15)，
+// 两闸相乘把"窗口内注入过"变成 30 分钟绝对拉黑——直接追问也召不回，比复读伤得重。
+// 现在：地板打在原始相关性分上 (garbage gate)，降权后的分只决定排位；
+// 若窗口内那条是唯一相关命中，它照样回来 (排它前面的没人)，这正是想要的行为。
 function injectDecayWindowMs(env: Env): number {
   const mins = Number(env.MEMORY_INJECT_DECAY_WINDOW_MIN);
   return Number.isFinite(mins) && mins > 0 ? mins * 60 * 1000 : 30 * 60 * 1000;
@@ -47,6 +51,13 @@ function injectDecayWindowMs(env: Env): number {
 function injectDecayFactor(env: Env): number {
   const f = Number(env.MEMORY_INJECT_DECAY_FACTOR);
   return Number.isFinite(f) && f > 0 && f < 1 ? f : 0.5;
+}
+
+// E 轴: 亲笔记忆 (authored_by 非空) 的排序加成。只影响排序，不影响地板。
+// 默认 1.15；上限 2 防手滑。设 "1" 等于关闭。
+function authoredBoost(env: Env): number {
+  const b = Number(env.MEMORY_AUTHORED_BOOST);
+  return Number.isFinite(b) && b >= 1 && b <= 2 ? b : 1.15;
 }
 
 function readRecallMinScore(env: Env, override?: number): number {
@@ -331,6 +342,11 @@ export interface RecallHit {
   backed: boolean;
   // 与 source_layer 中 memory/longtail 对应，供面板按类型统计 (不含 glossary，glossary 命中走单独的 glossary_hits)。
   kind: "memory" | "longtail";
+  // #37: 原始相关性分 (降权/加成前)。闸四地板判这个；score 是排序分。缺省时两者相同。
+  raw_score?: number;
+  // E 轴: 亲笔署名与响应倾向 (0011)。authored 命中吃排序加成，供面板观察。
+  authored_by?: string | null;
+  response_tendency?: string | null;
   // LMC-5 Y 轴 (additive, only when RELATION_EXPANSION on and hit came via edge)
   relation?: RelationExpansionMeta;
   contradicted_by?: string[];
@@ -411,9 +427,11 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     memories: rawMemories
   })) as MemoryApiRecordWithProvenance[];
 
-  // 3. 闸三: last_injected_at 近期注入过的降权 (不动 importance)
+  // 3. 闸三: last_injected_at 近期注入过的降权 (不动 importance)。
+  //    #37: score 是排序分 (原始分 × 降权 × 亲笔加成)；raw_score 是原始相关性分，闸四地板判它。
   const windowMs = injectDecayWindowMs(env);
   const factor = injectDecayFactor(env);
+  const boost = authoredBoost(env);
   const decayedIds: string[] = [];
   // #35: 记下每条命中的事实时间，末尾按周取块用。valid_as_of 是事实生效时间，
   // 比入库时间准；没有才退回 created_at。
@@ -423,15 +441,20 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     if (decay < 1) decayedIds.push(m.id);
     const factTime = m.valid_as_of ?? m.created_at;
     if (factTime) timeByMemoryId.set(m.id, factTime);
+    const rawScore = m.score ?? 0;
+    const authored = m.authored_by ?? null;
     return {
       id: m.id,
       content: m.content,
       type: m.type,
-      score: (m.score ?? 0) * decay,
+      score: rawScore * decay * (authored ? boost : 1),
+      raw_score: rawScore,
       source_layer: "memory" as const,
       source: m.source ?? null,
       backed: m.backed,
-      kind: "memory" as const
+      kind: "memory" as const,
+      authored_by: authored,
+      response_tendency: m.response_tendency ?? null
     };
   });
 
@@ -480,12 +503,15 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     longtailHits = await recallLongtailFallback(env, input);
   }
 
+  // 闸四: 绝对分数地板。#37 后判原始相关性分 (raw_score)，不判降权后的排序分——
+  // 地板管"跟问题相不相关"，闸三管"最近喂过没有"，两闸各司其职不再相乘。
+  // 关系扩展/长尾命中没有 raw_score，退回 score (它们不经闸三，两者本来就相等)。
   const beforeFloor = [...afterRelation, ...longtailHits]
     .sort((a, b) => b.score - a.score);
   const flooredIds: string[] = [];
   const allHits = beforeFloor
     .filter((hit) => {
-      if (hit.score >= minScore) return true;
+      if ((hit.raw_score ?? hit.score) >= minScore) return true;
       flooredIds.push(hit.id);
       return false;
     })

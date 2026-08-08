@@ -99,7 +99,10 @@ async function handleCreateMemory(
         tags: readStringArray(body.tags),
         source: readOptionalString(body.source) || profile.source,
         sourceMessageIds: readStringArray(body.source_message_ids),
-        validAsOf: readOptionalString(body.valid_as_of)
+        validAsOf: readOptionalString(body.valid_as_of),
+        // E 轴 (0011)：只在亲手来源 (mcp/manual/api) 时生效，db 层裁剪。
+        authoredBy: readOptionalString(body.authored_by),
+        responseTendency: readOptionalString(body.response_tendency)
       });
       const record = await getMemoryById(env.DB, { namespace, id: result.id });
       const lifecycleRows = record ? await fetchMemoryLifecycleRows(env.DB, [record.id]) : [];

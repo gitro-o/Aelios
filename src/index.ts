@@ -4,7 +4,8 @@ import {
   handleDiaryRewriteAdmin,
   handleMonthlyRollupAdmin,
   handleStarmap,
-  handleWeeklyRollupAdmin
+  handleWeeklyRollupAdmin,
+  handleWeeklyApproveAdmin
 } from "./api/admin";
 import { handleHealth } from "./api/health";
 import { handleCache } from "./api/cache";
@@ -82,6 +83,10 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/admin/weekly-rollup") {
       return handleWeeklyRollupAdmin(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/admin/weekly-approve") {
+      return handleWeeklyApproveAdmin(request, env);
     }
 
     if (request.method === "POST" && url.pathname === "/admin/monthly-rollup") {
