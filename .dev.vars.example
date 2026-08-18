@@ -1,0 +1,22 @@
+# Aelios 密钥清单（Deploy to Cloudflare 按钮会照这份文件生成填写表单；
+# 本地开发则复制成 .dev.vars 再填值）。
+# 规则：名字带 KEY / TOKEN 的在 Dashboard 里必须存成 Secret，不要存成 Variable。
+
+# ★ 唯一必填：自己编一个密码，客户端连 Aelios 时当 API Key 用。
+CHATBOX_API_KEY="sk-my-aelios"
+
+# 可选。给 Claude Code / Codex 挂 MCP 记忆用的 token；不用 MCP 留空即可。
+MEMORY_MCP_API_KEY=""
+
+# 可选。看图模式（导盲犬）的独立 key；不用留空即可。
+GUIDE_DOG_API_KEY=""
+
+# 可选。仅「维护工具」（Vectorize 对账/清理、重要记忆全量清单）需要；
+# 日常记、召、夜间整理都用不到。要用时在 Dashboard 补上再重新部署。
+CLOUDFLARE_ACCOUNT_ID=""
+CLOUDFLARE_API_TOKEN=""
+
+# 可选。想让 Aelios 兼任聊天转发网关才需要（见 README「完整聊天网关」一节）；
+# 只当记忆库留空即可。
+AI_GATEWAY_BASE_URL=""
+CF_AIG_TOKEN=""

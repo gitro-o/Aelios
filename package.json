@@ -6,9 +6,10 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy --keep-vars",
+    "deploy": "npm run setup:cloudflare && wrangler deploy --keep-vars",
     "setup:cloudflare": "node scripts/setup-cloudflare.mjs",
-    "deploy:cloudflare": "npm run setup:cloudflare && wrangler deploy --keep-vars",
+    "deploy:cloudflare": "npm run deploy",
+    "deploy:bare": "wrangler deploy --keep-vars",
     "typecheck": "tsc --noEmit",
     "verify": "npm run typecheck && node scripts/verify-assembler.mjs && node scripts/verify-vector-memory-write.mjs && npx tsx scripts/verify-dedup-gate.mjs && npx tsx scripts/verify-sanitize.mjs && npx tsx scripts/verify-week-blocks.mjs",
     "vectorize:clean": "node scripts/clean-vectorize-memory.mjs",
@@ -17,6 +18,25 @@
     "cache:test": "node scripts/test-claude-cache.mjs",
     "db:migrate:local": "wrangler d1 migrations apply companion_memory_proxy --local",
     "db:migrate:remote": "wrangler d1 migrations apply companion_memory_proxy --remote"
+  },
+  "cloudflare": {
+    "bindings": {
+      "CHATBOX_API_KEY": {
+        "description": "自己编一个密码（如 `sk-my-aelios`），客户端连 Aelios 时当 API Key 用。唯一必填的密钥。"
+      },
+      "MEMORY_MCP_API_KEY": {
+        "description": "可选。给 Claude Code / Codex 挂 MCP 记忆时用的 token，不用 MCP 可留空。"
+      },
+      "GUIDE_DOG_API_KEY": {
+        "description": "可选。看图模式（导盲犬）的独立 key，不用可留空。"
+      },
+      "CLOUDFLARE_ACCOUNT_ID": {
+        "description": "可选。仅维护工具（Vectorize 对账/清理）需要；日常记忆读写用不到。"
+      },
+      "CLOUDFLARE_API_TOKEN": {
+        "description": "可选。仅维护工具与网关模式的 Workers AI 转发需要；日常记忆读写用不到。"
+      }
+    }
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250927.0",

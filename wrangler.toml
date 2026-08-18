@@ -101,3 +101,8 @@ queue = "companion-memory"
 max_batch_size = 10
 max_batch_timeout = 30
 
+# 不写 database_id：Deploy 按钮 / wrangler 自动开资源按名字建库，
+# `npm run deploy` 里的 setup 脚本会在部署时回填真实 ID（只落在构建环境，不进 git）。
+[[d1_databases]]
+binding = "DB"
+database_name = "companion_memory_proxy"
