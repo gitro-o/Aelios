@@ -73,7 +73,7 @@ Aelios 是一个跑在 Cloudflare 上的记忆服务。你的 AI 客户端（Cha
 |---|---|---|
 | `CHATBOX_API_KEY` | Secret | 自己编一个密码，比如 `sk-my-aelios` |
 
-就这一个必填。`CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` 只有用到「维护工具」（Vectorize 对账清理）时才需要，日常记、召、夜间整理都用不到，可以以后再补。
+就这一个必填。`CLOUDFLARE_ACCOUNT_ID` 不用你填——部署时 setup 脚本从部署环境自动取了写进变量。`CLOUDFLARE_API_TOKEN` 只有用到「维护工具」（Vectorize 对账清理）时才需要，日常记、召、夜间整理都用不到，用到那天再补。
 
 > 名字里带 `KEY` / `TOKEN` 的必须选 **Secret**（加密、不进 git），不要选 Variable。详见 [SECRETS.md](./SECRETS.md)。完整密钥清单（哪些必填哪些可选）见 [.dev.vars.example](./.dev.vars.example)。
 
@@ -129,13 +129,15 @@ https://<你的 Worker 地址>/admin
 
 ## 给 Claude Code / Codex 加记忆（可选）
 
-环境变量加 `MEMORY_MCP_API_KEY`，然后在客户端的 MCP 配置里填：
+不用新钥匙，直接在客户端的 MCP 配置里填：
 
 ```
-URL:    https://<你的 Worker 地址>/mcp?token=<MEMORY_MCP_API_KEY>
+URL:    https://<你的 Worker 地址>/mcp?token=<你的 CHATBOX_API_KEY>
 ```
 
 你的官方客户端就有跨设备随身记忆了。
+
+想给 MCP 一把独立钥匙的话，加一个 Secret `MEMORY_MCP_API_KEY` 换到 URL 里用。区别有两点：这把钥匙只有记忆读写权限（不能调聊天转发），且经它写入的记忆按「亲笔」记档（E 轴署名，夜间整理不会自动改写）。单人自用不折腾这个也完全没问题。
 
 如果你想让 Claude Code 每次发消息前自动召回长期记忆，并把对话批量写回 Aelios，可以使用仓库自带的 Claude Code Hook：
 
@@ -360,9 +362,9 @@ hard delete: deleted/superseded/expired 超 30 天 → 先删 Vectorize 再删 D
 
 | 变量 | 说明 |
 |---|---|
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Account ID |
-| `CLOUDFLARE_API_TOKEN` | Cloudflare API Token（Secret） |
 | `CHATBOX_API_KEY` | 客户端 + 面板访问密钥（Secret） |
+
+`CLOUDFLARE_ACCOUNT_ID` 部署时由 setup 脚本自动写入；`CLOUDFLARE_API_TOKEN`（Secret）仅维护工具/网关模式 Workers AI 转发需要，均不在必填之列。
 
 ### 完整网关加填
 

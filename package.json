@@ -22,19 +22,7 @@
   "cloudflare": {
     "bindings": {
       "CHATBOX_API_KEY": {
-        "description": "自己编一个密码（如 `sk-my-aelios`），客户端连 Aelios 时当 API Key 用。唯一必填的密钥。"
-      },
-      "MEMORY_MCP_API_KEY": {
-        "description": "可选。给 Claude Code / Codex 挂 MCP 记忆时用的 token，不用 MCP 可留空。"
-      },
-      "GUIDE_DOG_API_KEY": {
-        "description": "可选。看图模式（导盲犬）的独立 key，不用可留空。"
-      },
-      "CLOUDFLARE_ACCOUNT_ID": {
-        "description": "可选。仅维护工具（Vectorize 对账/清理）需要；日常记忆读写用不到。"
-      },
-      "CLOUDFLARE_API_TOKEN": {
-        "description": "可选。仅维护工具与网关模式的 Workers AI 转发需要；日常记忆读写用不到。"
+        "description": "自己编一个密码（如 `sk-my-aelios`），客户端连 Aelios 时当 API Key 用。唯一要填的密钥，其余可选功能的钥匙见 SECRETS.md。"
       }
     }
   },

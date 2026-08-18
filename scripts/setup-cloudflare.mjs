@@ -309,7 +309,33 @@ function ensureVisibleVars() {
   }
 }
 
+// CLOUDFLARE_ACCOUNT_ID 不该让人手填：Workers Builds 构建环境本来就带着它，
+// 本地部署时 wrangler 登录态里也有。部署时自动写进 [vars]，
+// 运行时要用它的功能（Vectorize 对账等维护工具）就直接可用。
+function detectAccountId() {
+  const fromEnv = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  if (fromEnv) return fromEnv;
+  const who = run(["whoami"], { allowFailure: true, capture: true });
+  if (who.status !== 0 || !who.stdout) return null;
+  const ids = [...new Set(who.stdout.match(/\b[0-9a-f]{32}\b/g) || [])];
+  // 多账号时猜不得，宁可不填。
+  return ids.length === 1 ? ids[0] : null;
+}
+
+function ensureAccountIdVar() {
+  const accountId = detectAccountId();
+  if (!accountId) {
+    console.log(
+      "\nCLOUDFLARE_ACCOUNT_ID not auto-detected (no login or multiple accounts); skipping. Maintenance tools that need it can be configured later in the Dashboard."
+    );
+    return;
+  }
+  upsertVarFromEnvironment("CLOUDFLARE_ACCOUNT_ID", accountId);
+  console.log(`\nCLOUDFLARE_ACCOUNT_ID auto-filled into [vars] from the deploy environment.`);
+}
+
 ensureVisibleVars();
+ensureAccountIdVar();
 ensureD1();
 ensureVectorize();
 ensureQueue();
