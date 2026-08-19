@@ -46,6 +46,11 @@ Aelios 是一个跑在 Cloudflare 上的记忆服务。你的 AI 客户端（Cha
 
 表单里唯一必填的是 `CHATBOX_API_KEY`：自己编一个密码（比如 `sk-my-aelios`），以后客户端连 Aelios 就用它。其余全部可以留空，什么时候要用什么功能再回来补（见下文可选功能各节）。
 
+表单里其余几栏的标准答案：
+
+- **Vectorize 索引**：Dimensions 填 `1024`，Metric 选 `cosine`。嵌入模型 bge-m3 定死的值，照抄就行（这栏没法预填是 Cloudflare 表单自己的限制，已向上游反馈）。
+- **构建命令**（Build command）填 `npm ci`，**部署命令**（Deploy command）填 `npm run deploy`。
+
 部署完你会拿到一个地址：`https://companion-memory-proxy.<你的子域>.workers.dev`，直接跳到「[接客户端](#3-接客户端)」。
 
 ## 手动部署（想自己掌控每一步）

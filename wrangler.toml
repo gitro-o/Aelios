@@ -78,10 +78,10 @@ ANTHROPIC_CACHE_TTL = "5m"
 # keep this as "messages". If the base_url is only the root domain, use
 # "v1/messages".
 CUSTOM_ANTHROPIC_MESSAGES_PATH = "messages"
-# GitHub daily archive pull. Leave GITHUB_DAILY_REPO empty to disable.
-# Token: `wrangler secret put GITHUB_DAILY_TOKEN` (fine-grained PAT, read-only contents on target repo).
-GITHUB_DAILY_REPO = ""
-GITHUB_DAILY_PATH = "archive/daily"
+# GitHub daily archive pull（可选，默认禁用）。要用：去 Dashboard 手动加变量
+# GITHUB_DAILY_REPO（owner/repo）和 Secret GITHUB_DAILY_TOKEN（fine-grained PAT，
+# 只读目标仓库 Contents）；代码内默认路径 archive/daily，可用 GITHUB_DAILY_PATH 覆盖。
+# 注意：空值 var 别写进本文件——Deploy 按钮的表单会把空 vars 渲染成必填项，挡住一键部署。
 
 # Private/account-specific variables live in the Cloudflare Dashboard:
 # AI_GATEWAY_BASE_URL, CHATBOX_API_KEY, MEMORY_MCP_API_KEY,
