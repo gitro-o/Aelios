@@ -41,9 +41,16 @@ export interface Env {
   // /v1/memory/search 轮休重排后记账 last_injected_at 的头部条数，默认 10
   MEMORY_SEARCH_MARK_TOP?: string;
   // memory_recall 最低分地板，默认 0.15；调用方可用 min_score 临时覆盖。
+  // #37 后地板打在"原始相关性分"上 (降权前)，闸三只影响排序，不再把命中挤出地板。
   RECALL_MIN_SCORE?: string;
+  // E 轴: 亲笔记忆 (authored_by 非空) 的排序加成倍数，默认 1.15。只影响排序，不影响地板。
+  MEMORY_AUTHORED_BOOST?: string;
   // true = 丢弃没有有效 D1 记录背书的 Vectorize 命中 (清理 legacy 孤儿向量)，默认 false 保持现状。
   RECALL_REQUIRE_D1_BACKING?: string;
+  // #35 周块附带：命中记忆所在那一周的 weekly_log 整块随召回下发。默认开，"false" 关。
+  RECALL_WEEK_BLOCKS?: string;
+  // 一次召回最多附带几块周记，默认 2。块是上下文不是命中，不占 k 的名额。
+  RECALL_WEEK_BLOCK_LIMIT?: string;
   // LMC-5 Y 轴: 2-hop relation expansion. Default off (undefined/"off"/"false") = recall identical to pre-LMC5.
   // Set "on" or "true" to enable hop1/hop2 expansion after vector seed hits.
   RELATION_EXPANSION?: string;
@@ -63,6 +70,9 @@ export interface Env {
   EXTRACT_REVIEW_CONFIDENCE?: string;
   // weekly_log rollup after dream; default on unless "false"
   ENABLE_WEEKLY_ROLLUP?: string;
+  // weekly rollup 是否顺手删除该周 daily_log。默认 false：周记落成待审，
+  // 日志保留，审过后走 POST /admin/weekly-approve 亲手删。"true" 恢复旧行为 (写完即删，链上无人)。
+  WEEKLY_ROLLUP_DELETE_DAILIES?: string;
   // monthly_log rollup after weekly; default on unless "false"
   ENABLE_MONTHLY_ROLLUP?: string;
   // boot [Impressions] ladder char budget; default 1000
@@ -252,6 +262,9 @@ export interface MemoryRecord {
   fact_key?: string | null;
   version_status?: MemoryVersionStatus | string | null;
   superseded_by?: string | null;
+  // LMC-5 E 轴: 本体列 (0011)。只许亲手写 (HAND_AUTHOR_SOURCES)，蒸馏链禁写。
+  authored_by?: string | null;
+  response_tendency?: string | null;
 }
 
 // v2 字段侧车表 (母帖 #11 第 1 步，sidecar 版)。
@@ -302,6 +315,9 @@ export interface MemoryApiRecord {
   // --- LMC-5 Z 轴 (memories 本体，可选 additive) ---
   version_status?: MemoryVersionStatus | string | null;
   superseded_by?: string | null;
+  // --- LMC-5 E 轴 (memories 本体 0011，可选 additive) ---
+  authored_by?: string | null;
+  response_tendency?: string | null;
 }
 
 // LMC-5 Y 轴: relation 边类型

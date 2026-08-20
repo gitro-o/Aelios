@@ -46,12 +46,16 @@ VISION_MODEL = "workers-ai/@cf/google/gemma-4-26b-a4b-it"
 MEMORY_MIN_SCORE = "0.02"
 MEMORY_TOP_K = "50"
 # 记忆轮休 (search + v2 recall 共用, src/memory/rotation.ts):
-# 近期注入过的条目在窗口内打折, 高 recall_count 常客再乘疲劳折扣,
-# 防止同一批高分日记每轮召回都霸座。
+# 闸三降权 (#37 修正后): 只压排序，不参与地板判定。窗口内命中重排到队尾，唯一相关命中照样返回。
+# 疲劳折扣防高分日记霸座。
 MEMORY_INJECT_DECAY_WINDOW_MIN = "240"
-MEMORY_INJECT_DECAY_FACTOR = "0.35"
+MEMORY_INJECT_DECAY_FACTOR = "0.15"
 MEMORY_FATIGUE_ALPHA = "0.15"
 MEMORY_SEARCH_MARK_TOP = "10"
+# E 轴: 亲笔记忆 (authored_by 非空) 排序加成，只影响排序不影响地板。"1" 关闭。
+MEMORY_AUTHORED_BOOST = "1.15"
+# 审阅闸: cron 周记落成待审，不顺手删 daily_log。
+WEEKLY_ROLLUP_DELETE_DAILIES = "false"
 MEMORY_RERANKER_MODEL = "workers-ai/@cf/baai/bge-reranker-base"
 VECTORIZE_INDEX_NAME = "memo-kb"
 EMBEDDING_MODEL = "workers-ai/@cf/baai/bge-m3"
@@ -73,10 +77,10 @@ ANTHROPIC_CACHE_TTL = "5m"
 # keep this as "messages". If the base_url is only the root domain, use
 # "v1/messages".
 CUSTOM_ANTHROPIC_MESSAGES_PATH = "messages"
-# GitHub daily archive pull. Leave GITHUB_DAILY_REPO empty to disable.
-# Token: `wrangler secret put GITHUB_DAILY_TOKEN` (fine-grained PAT, read-only contents on target repo).
-GITHUB_DAILY_REPO = ""
-GITHUB_DAILY_PATH = "archive/daily"
+# GitHub daily archive pull（可选，默认禁用）。要用：去 Dashboard 手动加变量
+# GITHUB_DAILY_REPO（owner/repo）和 Secret GITHUB_DAILY_TOKEN（fine-grained PAT，
+# 只读目标仓库 Contents）；代码内默认路径 archive/daily，可用 GITHUB_DAILY_PATH 覆盖。
+# 注意：空值 var 别写进本文件——Deploy 按钮的表单会把空 vars 渲染成必填项，挡住一键部署。
 
 # Private/account-specific variables live in the Cloudflare Dashboard:
 # AI_GATEWAY_BASE_URL, CHATBOX_API_KEY, MEMORY_MCP_API_KEY,
@@ -95,3 +99,9 @@ queue = "companion-memory"
 queue = "companion-memory"
 max_batch_size = 10
 max_batch_timeout = 30
+
+# 不写 database_id：Deploy 按钮 / wrangler 自动开资源按名字建库，
+# `npm run deploy` 里的 setup 脚本会在部署时回填真实 ID（只落在构建环境，不进 git）。
+[[d1_databases]]
+binding = "DB"
+database_name = "companion_memory_proxy"

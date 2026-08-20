@@ -24,6 +24,7 @@ import {
   fetchMemoryLifecycleRows,
   getDailyLog,
   getMemoryCandidateById,
+  HandAuthoredProtectedError,
   listGlossary,
   listMemoryCandidates,
   listPrecious,
@@ -108,7 +109,10 @@ async function handleCreateMemory(
         tags: readStringArray(body.tags),
         source: readOptionalString(body.source) || profile.source,
         sourceMessageIds: readStringArray(body.source_message_ids),
-        validAsOf: readOptionalString(body.valid_as_of)
+        validAsOf: readOptionalString(body.valid_as_of),
+        // E 轴 (0011)：只在亲手来源 (mcp/manual/api) 时生效，db 层裁剪。
+        authoredBy: readOptionalString(body.authored_by),
+        responseTendency: readOptionalString(body.response_tendency)
       });
       const record = await getMemoryById(env.DB, { namespace, id: result.id });
       const lifecycleRows = record ? await fetchMemoryLifecycleRows(env.DB, [record.id]) : [];
@@ -339,11 +343,16 @@ async function handleRecallMemories(request: Request, env: Env, profile: KeyProf
       score: d.score
     }));
     const patch = formatMemoryPatch(promptRecords);
-    if (result.glossary_hits.length > 0) {
-      const glossaryLines = result.glossary_hits.map(
-        (g) => `- [glossary] ${g.term}: ${g.definition}`
-      );
-      prompt = patch ? `${patch}\n${glossaryLines.join("\n")}` : glossaryLines.join("\n");
+    const extraLines = [
+      ...result.glossary_hits.map((g) => `- [glossary] ${g.term}: ${g.definition}`),
+      // #35: 周块跟命中平行注入。标出周次和起止日期，让模型知道这是那一整段时间的概貌，
+      // 不是又一条碎片。
+      ...result.week_blocks.map(
+        (b) => `- [周记 ${b.week} ${b.start_date}~${b.end_date}] ${b.title}：${b.summary}`
+      )
+    ];
+    if (extraLines.length > 0) {
+      prompt = patch ? `${patch}\n${extraLines.join("\n")}` : extraLines.join("\n");
     } else {
       prompt = patch || undefined;
     }
@@ -351,12 +360,15 @@ async function handleRecallMemories(request: Request, env: Env, profile: KeyProf
 
   return json({
     data,
+    // #35: 周块与 data 平行下发，不混进 data —— 它是上下文块，不是命中。
+    week_blocks: result.week_blocks,
     meta: {
       namespace,
       backend: "v2-recall",
       top_k: k,
       count: data.length,
       glossary_hits: result.glossary_hits.length,
+      week_block_count: result.week_blocks.length,
       ...result.meta
     },
     ...(prompt ? { prompt } : {})
@@ -802,6 +814,16 @@ async function createApprovedMemoryFromCandidate(
   return { id: created.id, action: "created" };
 }
 
+// E 轴保护撞到候选处置路径时，给 reviewer 一个可读的 409 而不是裸 500 (#33)。
+function handAuthoredConflict(error: unknown): Response | null {
+  if (!(error instanceof HandAuthoredProtectedError)) return null;
+  return openAiError(
+    "目标记忆是亲笔写入（E 轴保护），审核链只可提案、不可覆写。这条候选请选「丢弃」；确要更新原文，去重要记忆页亲手编辑或取代那条记忆。",
+    409,
+    "hand_authored_protected"
+  );
+}
+
 export async function handleMemoryCandidates(request: Request, env: Env): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
@@ -866,19 +888,26 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
         target.status === "active" &&
         target.version_status !== "superseded";
       if (targetActive) {
-        const result = await supersedeMemory(env, {
-          namespace,
-          oldId: candidate.target_memory_id,
-          newContent: content,
-          newType: type,
-          newFactKey: factKey,
-          confidence,
-          importance,
-          tags,
-          source: "review",
-          sourceMessageIds,
-          reason: "approve_update"
-        });
+        let result;
+        try {
+          result = await supersedeMemory(env, {
+            namespace,
+            oldId: candidate.target_memory_id,
+            newContent: content,
+            newType: type,
+            newFactKey: factKey,
+            confidence,
+            importance,
+            tags,
+            source: "review",
+            sourceMessageIds,
+            reason: "approve_update"
+          });
+        } catch (error) {
+          const conflict = handAuthoredConflict(error);
+          if (conflict) return conflict;
+          throw error;
+        }
         const updated = await updateMemoryCandidateStatus(env.DB, {
           namespace,
           id,
@@ -900,18 +929,25 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
     const fallbackNote = candidate.target_memory_id
       ? `${readString(body.decision_note) || "approved"}; target_gone_fallback`
       : readString(body.decision_note) || "approved";
-    const approval = await createApprovedMemoryFromCandidate(env, {
-      namespace,
-      type,
-      content,
-      factKey,
-      confidence,
-      importance,
-      tags,
-      sourceMessageIds,
-      source: "review",
-      excludeIds: candidate.target_memory_id ? [candidate.target_memory_id] : undefined
-    });
+    let approval;
+    try {
+      approval = await createApprovedMemoryFromCandidate(env, {
+        namespace,
+        type,
+        content,
+        factKey,
+        confidence,
+        importance,
+        tags,
+        sourceMessageIds,
+        source: "review",
+        excludeIds: candidate.target_memory_id ? [candidate.target_memory_id] : undefined
+      });
+    } catch (error) {
+      const conflict = handAuthoredConflict(error);
+      if (conflict) return conflict;
+      throw error;
+    }
     const updated = await updateMemoryCandidateStatus(env.DB, {
       namespace,
       id,
@@ -971,19 +1007,26 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
   if (action === "supersede") {
     const oldId = readString(body.target_id);
     if (!oldId) return openAiError("target_id is required", 400);
-    const result = await supersedeMemory(env, {
-      namespace,
-      oldId,
-      newContent: content,
-      newType: type,
-      newFactKey: factKey,
-      confidence,
-      importance,
-      tags,
-      source: "review",
-      sourceMessageIds,
-      reason: readString(body.decision_note) || "candidate_supersede"
-    });
+    let result;
+    try {
+      result = await supersedeMemory(env, {
+        namespace,
+        oldId,
+        newContent: content,
+        newType: type,
+        newFactKey: factKey,
+        confidence,
+        importance,
+        tags,
+        source: "review",
+        sourceMessageIds,
+        reason: readString(body.decision_note) || "candidate_supersede"
+      });
+    } catch (error) {
+      const conflict = handAuthoredConflict(error);
+      if (conflict) return conflict;
+      throw error;
+    }
     const updated = await updateMemoryCandidateStatus(env.DB, {
       namespace,
       id,

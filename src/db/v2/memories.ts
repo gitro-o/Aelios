@@ -89,6 +89,40 @@ export async function listActiveFactKeys(
 // memories 表只写 v1 列 + status；侧车表靠 memory_id 关联，PRIMARY KEY 一对一。
 // =====================================================================
 
+// =====================================================================
+// LMC-5 E 轴写入闸 (0011)。
+// authored_by / response_tendency 只许"亲手"来源写：mcp (旦九的手)、manual、api。
+// 蒸馏链 (dream/judge/extract/supersede 默认值等) 一律禁写这两列；
+// 且亲笔记忆 (authored_by 非空) 禁止被蒸馏链改写内容——撞上直接抛错，
+// 调用方 (dream/judge 每条独立 try/catch) 记失败跳过，亲笔原文保住。
+// =====================================================================
+
+const HAND_AUTHOR_SOURCES = new Set(["mcp", "manual", "api"]);
+
+export function isHandAuthorSource(source: string | null | undefined): boolean {
+  return typeof source === "string" && HAND_AUTHOR_SOURCES.has(source);
+}
+
+export class HandAuthoredProtectedError extends Error {
+  constructor(id: string) {
+    super(`memory ${id} is hand-authored (E-axis); automated writers may propose but not overwrite`);
+    this.name = "HandAuthoredProtectedError";
+  }
+}
+
+// 按来源裁剪 E 轴字段：非亲手来源写入时两列强制 null。
+function eAxisFieldsForWrite(input: {
+  source?: string | null;
+  authoredBy?: string | null;
+  responseTendency?: string | null;
+}): { authoredBy: string | null; responseTendency: string | null } {
+  if (!isHandAuthorSource(input.source)) return { authoredBy: null, responseTendency: null };
+  return {
+    authoredBy: input.authoredBy?.trim() || null,
+    responseTendency: input.responseTendency?.trim() || null
+  };
+}
+
 export interface MemoryV2Patch {
   type?: string;
   content?: string;
@@ -137,16 +171,18 @@ export async function fetchMemoryLifecycleRows(
 // 同时写 D1 (本体) 和 Vectorize (检索镜像)，设 vector_id，否则 recall 召不到。
 export async function upsertMemoryByFactKey(
   env: Env,
-  input: { namespace: string; factKey: string; content: string; summary?: string | null; type?: string; importance?: number; confidence?: number; tags?: string[]; source?: string | null; sourceMessageIds?: string[]; validAsOf?: string | null }
+  input: { namespace: string; factKey: string; content: string; summary?: string | null; type?: string; importance?: number; confidence?: number; tags?: string[]; source?: string | null; sourceMessageIds?: string[]; validAsOf?: string | null; authoredBy?: string | null; responseTendency?: string | null }
 ): Promise<{ id: string; created: boolean }> {
   const db = env.DB;
   const now = nowIso();
+  const handSource = isHandAuthorSource(input.source);
+  const eAxis = eAxisFieldsForWrite(input);
 
   // 先查同 fact_key 的 current active memory：本体 fact_key 优先，侧车兜底。
   // version_status=superseded 不参与 upsert 命中（LMC-5）。
   const existing = await db
     .prepare(
-      `SELECT m.id FROM memories m
+      `SELECT m.id, m.authored_by, m.response_tendency FROM memories m
        LEFT JOIN memory_lifecycle lc ON lc.memory_id = m.id
        WHERE m.namespace = ? AND m.status = 'active'
          AND (m.version_status IS NULL OR m.version_status IN ('current', 'under_review'))
@@ -155,15 +191,23 @@ export async function upsertMemoryByFactKey(
        LIMIT 1`
     )
     .bind(input.namespace, input.factKey, input.factKey)
-    .first<{ id: string }>();
+    .first<{ id: string; authored_by: string | null; response_tendency: string | null }>();
 
   if (existing) {
-    // 更新 memories 本体 (v1 列 + LMC-5 fact_key/version_status)
+    // E 轴保护：亲笔记忆不接受蒸馏链改写 (dream/judge 的候选路径可提案，落笔归人)。
+    if (existing.authored_by && !handSource) {
+      throw new HandAuthoredProtectedError(existing.id);
+    }
+    // 更新 memories 本体 (v1 列 + LMC-5 fact_key/version_status)。
+    // E 轴两列只在亲手来源时更新；不传就继承已有值 (亲手改内容不该抹掉旧署名)，
+    // 与 supersede 的继承原则一致。蒸馏链更新一条无主记忆时不碰它们 (保持 null)。
     await db
       .prepare(
         `UPDATE memories SET content = ?, summary = ?, type = ?, importance = ?, confidence = ?,
           tags = ?, source = ?, source_message_ids = ?, updated_at = ?,
-          fact_key = ?, version_status = COALESCE(version_status, 'current')
+          fact_key = ?, version_status = COALESCE(version_status, 'current')${
+            handSource ? ", authored_by = ?, response_tendency = ?" : ""
+          }
          WHERE id = ?`
       )
       .bind(
@@ -177,6 +221,12 @@ export async function upsertMemoryByFactKey(
         JSON.stringify(input.sourceMessageIds ?? []),
         now,
         input.factKey,
+        ...(handSource
+          ? [
+              eAxis.authoredBy ?? existing.authored_by,
+              eAxis.responseTendency ?? existing.response_tendency
+            ]
+          : []),
         existing.id
       )
       .run();
@@ -192,7 +242,7 @@ export async function upsertMemoryByFactKey(
     return { id: existing.id, created: false };
   }
 
-  // 新增：先插 memories 本体 (v1 列 + vector_id + LMC-5 版本列)，再插侧车行。
+  // 新增：先插 memories 本体 (v1 列 + vector_id + LMC-5 版本列 + E 轴列)，再插侧车行。
   const id = newId("mem");
   const vectorId = `mem_${id}`;
   await db
@@ -200,8 +250,8 @@ export async function upsertMemoryByFactKey(
       `INSERT INTO memories (
         id, namespace, type, content, summary, importance, confidence, status, pinned,
         tags, source, source_message_ids, vector_id, created_at, updated_at, expires_at,
-        fact_key, version_status, superseded_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, null, ?, 'current', null)`
+        fact_key, version_status, superseded_by, authored_by, response_tendency
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, null, ?, 'current', null, ?, ?)`
     )
     .bind(
       id,
@@ -217,7 +267,9 @@ export async function upsertMemoryByFactKey(
       vectorId,
       now,
       now,
-      input.factKey
+      input.factKey,
+      eAxis.authoredBy,
+      eAxis.responseTendency
     )
     .run();
 
@@ -344,13 +396,24 @@ export async function supersedeMemory(
     tags?: string[];
     source?: string | null;
     sourceMessageIds?: string[];
+    authoredBy?: string | null;
+    responseTendency?: string | null;
   }
 ): Promise<{ oldStatus: string; newId: string }> {
   const db = env.DB;
   const now = nowIso();
+  // 注意：supersede 的 source 默认值是 "supersede" (非亲手)，
+  // 亲手 supersede 必须显式传 source:"mcp"/"manual"/"api" 才能带 E 轴字段。
+  const effectiveSource = input.source ?? "supersede";
+  const handSource = isHandAuthorSource(effectiveSource);
+  const eAxis = eAxisFieldsForWrite({
+    source: effectiveSource,
+    authoredBy: input.authoredBy,
+    responseTendency: input.responseTendency
+  });
   const old = await db
     .prepare(
-      `SELECT id, status, vector_id, fact_key, type FROM memories WHERE namespace = ? AND id = ?`
+      `SELECT id, status, vector_id, fact_key, type, authored_by, response_tendency FROM memories WHERE namespace = ? AND id = ?`
     )
     .bind(input.namespace, input.oldId)
     .first<{
@@ -359,7 +422,14 @@ export async function supersedeMemory(
       vector_id: string | null;
       fact_key: string | null;
       type: string;
+      authored_by: string | null;
+      response_tendency: string | null;
     }>();
+
+  // E 轴保护：亲笔记忆不许被蒸馏链 supersede (dream/judge 撞上抛错，各自的 per-item catch 会记失败跳过)。
+  if (old?.authored_by && !handSource) {
+    throw new HandAuthoredProtectedError(old.id);
+  }
 
   const nextId = newId("mem");
   const nextVectorId = `mem_${nextId}`;
@@ -385,8 +455,8 @@ export async function supersedeMemory(
         `INSERT INTO memories (
           id, namespace, type, content, importance, confidence, status, pinned,
           tags, source, source_message_ids, vector_id, created_at, updated_at, expires_at,
-          fact_key, version_status, superseded_by
-        ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, null, ?, 'current', null)`
+          fact_key, version_status, superseded_by, authored_by, response_tendency
+        ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, null, ?, 'current', null, ?, ?)`
       )
       .bind(
         nextId,
@@ -396,12 +466,14 @@ export async function supersedeMemory(
         input.importance ?? 0.6,
         input.confidence ?? 0.8,
         JSON.stringify(input.tags ?? []),
-        input.source ?? "supersede",
+        effectiveSource,
         JSON.stringify(input.sourceMessageIds ?? []),
         nextVectorId,
         now,
         now,
-        newFactKey
+        newFactKey,
+        eAxis.authoredBy,
+        eAxis.responseTendency
       )
       .run();
     await db
@@ -440,14 +512,19 @@ export async function supersedeMemory(
     .bind(nextId, input.reason ?? null, old.id)
     .run();
 
-  // 2. 插新条目 (current，继承 fact_key)
+  // 2. 插新条目 (current，继承 fact_key)。
+  //    亲手 supersede 亲笔记忆时，新条 E 轴取显式入参；没传则继承旧条 (亲笔链不断，倾向同理)。
+  const nextAuthoredBy = handSource ? (eAxis.authoredBy ?? old.authored_by) : null;
+  const nextResponseTendency = handSource
+    ? (eAxis.responseTendency ?? old.response_tendency)
+    : null;
   await db
     .prepare(
       `INSERT INTO memories (
         id, namespace, type, content, importance, confidence, status, pinned,
         tags, source, source_message_ids, vector_id, created_at, updated_at, expires_at,
-        fact_key, version_status, superseded_by
-      ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, null, ?, 'current', null)`
+        fact_key, version_status, superseded_by, authored_by, response_tendency
+      ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, null, ?, 'current', null, ?, ?)`
     )
     .bind(
       nextId,
@@ -457,12 +534,14 @@ export async function supersedeMemory(
       input.importance ?? 0.6,
       input.confidence ?? 0.8,
       JSON.stringify(input.tags ?? []),
-      input.source ?? "supersede",
+      effectiveSource,
       JSON.stringify(input.sourceMessageIds ?? []),
       nextVectorId,
       now,
       now,
-      newFactKey
+      newFactKey,
+      nextAuthoredBy,
+      nextResponseTendency
     )
     .run();
   await db

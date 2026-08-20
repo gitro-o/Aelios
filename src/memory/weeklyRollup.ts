@@ -70,6 +70,13 @@ function isWeeklyRollupEnabled(env: Env): boolean {
   return true;
 }
 
+// 审阅闸：cron 生成周记是"落成待审"，日志删除是不可逆动作，默认不许 cron 顺手做。
+// 审过之后走 POST /admin/weekly-approve 亲手删 (approveWeeklyRollup)。
+// 显式设 "true" 恢复旧行为 (2026-08-08 前：04:10 生成+落库+删日志一条龙，链上无人)。
+function shouldDeleteDailies(env: Env): boolean {
+  return readString(env.WEEKLY_ROLLUP_DELETE_DAILIES) === "true";
+}
+
 function readRollupModel(env: Env): string {
   return readModelName(env, ["DREAM_MODEL", "DAILY_DIGEST_MODEL", "SUMMARY_MODEL"], DEFAULT_DREAM_MODEL);
 }
@@ -274,7 +281,7 @@ async function processWeek(
       endDate: weekRange.sunday
     });
     let deletedDays = 0;
-    if (!dryRun) {
+    if (!dryRun && shouldDeleteDailies(env)) {
       deletedDays = await deleteDailyLogsInRange(env.DB, {
         namespace,
         startDate: weekRange.monday,
@@ -284,7 +291,7 @@ async function processWeek(
     return {
       ...baseDetail,
       status: "skipped",
-      reason: "already_rolled_up",
+      reason: shouldDeleteDailies(env) ? "already_rolled_up" : "already_rolled_up_dailies_kept_for_review",
       source_days: leftoverDailyLogs.length,
       deleted_days: deletedDays
     };
@@ -330,6 +337,8 @@ async function processWeek(
   }
 
   try {
+    // 审阅闸：默认只写周记不删日志 (落成待审)；WEEKLY_ROLLUP_DELETE_DAILIES=true 才恢复同批删除。
+    const deleteDailies = shouldDeleteDailies(env);
     const upsertStmt = bindUpsertWeeklyLogStatement(env.DB, {
       namespace,
       week: weekRange.week,
@@ -339,12 +348,18 @@ async function processWeek(
       summary: modelResult.result.summary,
       sourceDays: dailyLogs.length
     });
-    const deleteStmt = bindDeleteDailyLogsInRangeStatement(env.DB, {
-      namespace,
-      startDate: weekRange.monday,
-      endDate: weekRange.sunday
-    });
-    const [, deleteResult] = await env.DB.batch([upsertStmt, deleteStmt]);
+    let deletedDays = 0;
+    if (deleteDailies) {
+      const deleteStmt = bindDeleteDailyLogsInRangeStatement(env.DB, {
+        namespace,
+        startDate: weekRange.monday,
+        endDate: weekRange.sunday
+      });
+      const [, deleteResult] = await env.DB.batch([upsertStmt, deleteStmt]);
+      deletedDays = deleteResult.meta?.changes ?? 0;
+    } else {
+      await env.DB.batch([upsertStmt]);
+    }
 
     const saved = await getWeeklyLog(env.DB, { namespace, week: weekRange.week });
     if (!saved) {
@@ -356,13 +371,12 @@ async function processWeek(
       };
     }
 
-    const deletedDays = deleteResult.meta?.changes ?? 0;
-
     return {
       ...baseDetail,
       status: "rolled_up",
       source_days: dailyLogs.length,
       deleted_days: deletedDays,
+      ...(deleteDailies ? {} : { reason: "dailies_kept_for_review" }),
       title: saved.title,
       summary: saved.summary
     };
@@ -380,6 +394,29 @@ async function processWeek(
       reason
     };
   }
+}
+
+// 审阅通过后的亲手删除：核对该周 weekly_log 确实存在，才删它范围内的 daily_log。
+// 这是 /admin/weekly-approve 的执行体——审阅链上的"人"就在这一步。
+export async function approveWeeklyRollup(
+  env: Env,
+  input: { namespace: string; week: string }
+): Promise<{ week: string; start_date: string; end_date: string; deleted_days: number }> {
+  const weekly = await getWeeklyLog(env.DB, { namespace: input.namespace, week: input.week });
+  if (!weekly) {
+    throw new Error(`weekly_log ${input.week} not found; roll it up before approving`);
+  }
+  const deletedDays = await deleteDailyLogsInRange(env.DB, {
+    namespace: input.namespace,
+    startDate: weekly.start_date,
+    endDate: weekly.end_date
+  });
+  return {
+    week: weekly.week,
+    start_date: weekly.start_date,
+    end_date: weekly.end_date,
+    deleted_days: deletedDays
+  };
 }
 
 export async function runWeeklyRollup(

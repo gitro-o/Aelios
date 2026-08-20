@@ -17,10 +17,12 @@ import {
   listGlossary,
   listRecentMonthlyLogs,
   listRecentWeeklyLogs,
+  getWeeklyLog,
   fetchLongtailByIds,
   matchGlossary,
   markMemoriesInjected
 } from "../../db/v2";
+import { getIsoWeekLabelForDateLabel } from "../weeklyRollup";
 import { searchMemoriesWithProvenance } from "../search";
 import type { MemoryApiRecordWithProvenance } from "../search";
 import { filterAndCompressMemories } from "../filter";
@@ -30,11 +32,8 @@ import type { RelationExpansionMeta } from "../relations";
 import { loadSpontaneousForBoot } from "../perception";
 import type { Env, PerceptionCacheItem } from "../../types";
 import {
-  decayForLastInjected,
   fatigueAlpha,
-  fatigueForRecallCount,
-  injectDecayFactor,
-  injectDecayWindowMs
+  fatigueForRecallCount
 } from "../rotation";
 
 // --- 开关 ---
@@ -43,9 +42,73 @@ export function isV2Enabled(env: Env): boolean {
   return env.MEMORY_LIFECYCLE_ENABLED !== "false";
 }
 
+// 闸三: 近期注入过的降权系数。last_injected_at 在窗口内打折扣。
+// 窗口/系数做成 env 可配，不配走默认 (30 分钟 / 0.5)。
+// #37 修正：降权只压排序，不再参与闸四地板判定。修正前 factor(0.15)×命中分 ≤ 地板(0.15)，
+// 两闸相乘把"窗口内注入过"变成 30 分钟绝对拉黑——直接追问也召不回，比复读伤得重。
+// 现在：地板打在原始相关性分上 (garbage gate)，降权后的分只决定排位；
+// 若窗口内那条是唯一相关命中，它照样回来 (排它前面的没人)，这正是想要的行为。
+function injectDecayWindowMs(env: Env): number {
+  const mins = Number(env.MEMORY_INJECT_DECAY_WINDOW_MIN);
+  return Number.isFinite(mins) && mins > 0 ? mins * 60 * 1000 : 30 * 60 * 1000;
+}
+function injectDecayFactor(env: Env): number {
+  const f = Number(env.MEMORY_INJECT_DECAY_FACTOR);
+  return Number.isFinite(f) && f > 0 && f < 1 ? f : 0.5;
+}
+
+// E 轴: 亲笔记忆 (authored_by 非空) 的排序加成。只影响排序，不影响地板。
+// 默认 1.15；上限 2 防手滑。设 "1" 等于关闭。
+function authoredBoost(env: Env): number {
+  const b = Number(env.MEMORY_AUTHORED_BOOST);
+  return Number.isFinite(b) && b >= 1 && b <= 2 ? b : 1.15;
+}
+
 function readRecallMinScore(env: Env, override?: number): number {
   const raw = override ?? Number(env.RECALL_MIN_SCORE ?? 0.15);
   return Number.isFinite(raw) ? Math.min(Math.max(raw, 0), 1) : 0.15;
+}
+
+// --- 周块附带 (#35，过渡方案) ---
+// 病：召回出来全是原子碎片，没有宏观上下文。weekly_log 本身已经是聚好的、
+// 可读的、带时间范围的块，但只有显式 diary_get 拿得到。
+//
+// 与 embedding.ts 的隔离不变量的关系：那条不变量禁的是「daily/weekly/monthly_log
+// 永不 embed、永不进检索通道」。这里不 embed、不查向量、不混进 hits 数组，
+// 走的是命中之后按周 join 取整块，属于附带上下文，不是检索结果。
+// 所以周块必须留在 week_blocks 字段里，谁都不许把它 push 进 hits。
+//
+// 二档 scenarios 表上线后，取值源换成真正的场景块，这段整体退役。
+function isWeekBlockEnabled(env: Env): boolean {
+  return env.RECALL_WEEK_BLOCKS !== "false";
+}
+function weekBlockLimit(env: Env): number {
+  const n = Number(env.RECALL_WEEK_BLOCK_LIMIT);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 2;
+}
+
+function dateLabelInTimeZone(iso: string, timeZone: string): string | null {
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return null;
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date(ts));
+}
+
+function decayForLastInjected(
+  lastInjectedAt: string | null,
+  windowMs: number,
+  factor: number,
+  now = Date.now()
+): number {
+  if (!lastInjectedAt) return 1;
+  const ts = Date.parse(lastInjectedAt);
+  if (!Number.isFinite(ts)) return 1;
+  if (now - ts > windowMs) return 1;
+  return factor;
 }
 
 // =====================================================================
@@ -260,6 +323,10 @@ export interface RecallInput {
   core_fingerprint?: CoreFingerprint;
   // LMC-5 additive: when true, allow version_status=superseded hits (history). Default false.
   include_history?: boolean;
+  // #35: 调用方已经从别处给了模型哪几周的周记，这里就不重复带。
+  // 同时构建 boot 和 recall 的调用方 (chatCompletions) 应当传 boot 那条 weekly 的 label；
+  // 只调 recall 的调用方 (hook 走 /v1/memory/recall) 不传，否则会白丢最有用的那块。
+  exclude_weeks?: string[];
   // When set (chat hot path), injection accounting is scheduled off the response path.
   waitUntil?: (promise: Promise<unknown>) => void;
 }
@@ -279,14 +346,32 @@ export interface RecallHit {
   backed: boolean;
   // 与 source_layer 中 memory/longtail 对应，供面板按类型统计 (不含 glossary，glossary 命中走单独的 glossary_hits)。
   kind: "memory" | "longtail";
+  // #37: 原始相关性分 (降权/加成前)。闸四地板判这个；score 是排序分。缺省时两者相同。
+  raw_score?: number;
+  // E 轴: 亲笔署名与响应倾向 (0011)。authored 命中吃排序加成，供面板观察。
+  authored_by?: string | null;
+  response_tendency?: string | null;
   // LMC-5 Y 轴 (additive, only when RELATION_EXPANSION on and hit came via edge)
   relation?: RelationExpansionMeta;
   contradicted_by?: string[];
 }
 
+// #35: 命中记忆所在那一周的 weekly_log 整块。跟 hits 平行，不参与 min_score 过滤，
+// 不占 k 的名额 —— 它是上下文，不是命中。
+export interface RecallWeekBlock {
+  week: string;
+  start_date: string;
+  end_date: string;
+  title: string;
+  summary: string;
+  // 哪几条命中把这一周带出来的，供面板追溯，也方便二档迁移时对照。
+  seed_ids: string[];
+}
+
 export interface RecallResult {
   hits: RecallHit[];
   glossary_hits: Array<{ term: string; definition: string }>;
+  week_blocks: RecallWeekBlock[];
   meta: {
     decayed_ids: string[];
     deduped_ids: string[];
@@ -309,6 +394,7 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     return {
       hits: [],
       glossary_hits: [],
+      week_blocks: [],
       meta: {
         decayed_ids: [], deduped_ids: [], floored_ids: [], floored_count: 0, min_score: minScore, total: 0,
         unbacked_count: 0, unbacked_dropped: 0
@@ -345,25 +431,37 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     memories: rawMemories
   })) as MemoryApiRecordWithProvenance[];
 
-  // 3. 闸三: last_injected_at 近期注入过的降权 (不动 importance)
+  // 3. 闸三: last_injected_at 近期注入过的降权 (不动 importance)。
+  //    #37: score 是排序分 (原始分 × 降权 × 疲劳 × 亲笔加成)；raw_score 是原始相关性分，闸四地板判它。
   //    外加过曝疲劳: recall_count 高的常客再乘一道 log 缓坡折扣, pinned 豁免。
   const windowMs = injectDecayWindowMs(env);
   const factor = injectDecayFactor(env);
+  const boost = authoredBoost(env);
   const alpha = fatigueAlpha(env);
   const decayedIds: string[] = [];
+  // #35: 记下每条命中的事实时间，末尾按周取块用。valid_as_of 是事实生效时间，
+  // 比入库时间准；没有才退回 created_at。
+  const timeByMemoryId = new Map<string, string>();
   const scored: RecallHit[] = memories.map((m) => {
     const decay = m.pinned ? 1 : decayForLastInjected(m.last_injected_at ?? null, windowMs, factor);
     const fatigue = m.pinned ? 1 : fatigueForRecallCount(m.recall_count, alpha);
     if (decay < 1) decayedIds.push(m.id);
+    const factTime = m.valid_as_of ?? m.created_at;
+    if (factTime) timeByMemoryId.set(m.id, factTime);
+    const rawScore = m.score ?? 0;
+    const authored = m.authored_by ?? null;
     return {
       id: m.id,
       content: m.content,
       type: m.type,
-      score: (m.score ?? 0) * decay * fatigue,
+      score: rawScore * decay * fatigue * (authored ? boost : 1),
+      raw_score: rawScore,
       source_layer: "memory" as const,
       source: m.source ?? null,
       backed: m.backed,
-      kind: "memory" as const
+      kind: "memory" as const,
+      authored_by: authored,
+      response_tendency: m.response_tendency ?? null
     };
   });
 
@@ -412,12 +510,15 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     longtailHits = await recallLongtailFallback(env, input);
   }
 
+  // 闸四: 绝对分数地板。#37 后判原始相关性分 (raw_score)，不判降权后的排序分——
+  // 地板管"跟问题相不相关"，闸三管"最近喂过没有"，两闸各司其职不再相乘。
+  // 关系扩展/长尾命中没有 raw_score，退回 score (它们不经闸三，两者本来就相等)。
   const beforeFloor = [...afterRelation, ...longtailHits]
     .sort((a, b) => b.score - a.score);
   const flooredIds: string[] = [];
   const allHits = beforeFloor
     .filter((hit) => {
-      if (hit.score >= minScore) return true;
+      if ((hit.raw_score ?? hit.score) >= minScore) return true;
       flooredIds.push(hit.id);
       return false;
     })
@@ -440,9 +541,27 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
     }
   }
 
+  // 7. #35 周块附带。失败不影响召回主体，吞掉记日志。
+  let weekBlocks: RecallWeekBlock[] = [];
+  if (isWeekBlockEnabled(env) && allHits.length > 0) {
+    try {
+      weekBlocks = await collectWeekBlocks(env, {
+        namespace: input.namespace,
+        hits: allHits,
+        timeByMemoryId,
+        decayedIds: new Set(decayedIds),
+        excludeWeeks: input.exclude_weeks
+      });
+    } catch (error) {
+      console.error("v2 week block attach failed", error);
+      weekBlocks = [];
+    }
+  }
+
   return {
     hits: allHits,
     glossary_hits: glossaryHits,
+    week_blocks: weekBlocks,
     meta: {
       decayed_ids: decayedIds,
       deduped_ids: dedupedIds,
@@ -454,6 +573,69 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
       unbacked_dropped: unbackedDropped
     }
   };
+}
+
+// #35 周块附带。把命中记忆按事实时间归到 ISO 周，取那一周的 weekly_log 整块。
+//
+// 两条约束的落法：
+//   闸三延伸 —— weekly_log 表没有 last_injected_at 列，工单也定了不动 schema，
+//   所以周块不自己记账，跟着种子走：种子被闸三降权 (近期注入过) 就不带它的周。
+//   同一块连轮复读因此自动收敛，不需要新列。
+//   与 boot 去重 —— 交给调用方传 exclude_weeks，这里不自己猜。
+//   第一版我在这儿写死"剔掉最近一周，因为 boot 恒带它"，2026-08-07 生产验收当场打脸：
+//   weekly_log 的滚动比当前日期落后一两周 (daily 满 7 天才 rollup)，所以"最近一周"
+//   往往正是命中最密的那一周；而 hook 走的 /v1/memory/recall 根本不调 boot。
+//   结果是最有用的块被白扔。去重责任属于同时持有 boot 和 recall 的那一层。
+export async function collectWeekBlocks(
+  env: Env,
+  input: {
+    namespace: string;
+    hits: RecallHit[];
+    timeByMemoryId: Map<string, string>;
+    decayedIds: Set<string>;
+    excludeWeeks?: string[];
+  }
+): Promise<RecallWeekBlock[]> {
+  const timeZone = env.DREAM_TIME_ZONE || "Asia/Shanghai";
+
+  const seedsByWeek = new Map<string, string[]>();
+  for (const hit of input.hits) {
+    if (hit.source_layer !== "memory") continue;
+    if (input.decayedIds.has(hit.id)) continue;
+    const factTime = input.timeByMemoryId.get(hit.id);
+    if (!factTime) continue;
+    const dateLabel = dateLabelInTimeZone(factTime, timeZone);
+    if (!dateLabel) continue;
+    const week = getIsoWeekLabelForDateLabel(dateLabel, timeZone);
+    const seeds = seedsByWeek.get(week);
+    if (seeds) seeds.push(hit.id);
+    else seedsByWeek.set(week, [hit.id]);
+  }
+  if (seedsByWeek.size === 0) return [];
+
+  for (const week of input.excludeWeeks ?? []) seedsByWeek.delete(week);
+  if (seedsByWeek.size === 0) return [];
+
+  // 命中多的周排前面；打平了按周从新到旧。
+  const ranked = [...seedsByWeek.entries()]
+    .sort((a, b) => b[1].length - a[1].length || b[0].localeCompare(a[0]))
+    .slice(0, weekBlockLimit(env));
+
+  const rows = await Promise.all(
+    ranked.map(([week]) => getWeeklyLog(env.DB, { namespace: input.namespace, week }))
+  );
+
+  return rows.flatMap((row, i) => {
+    if (!row) return [];
+    return [{
+      week: row.week,
+      start_date: row.start_date,
+      end_date: row.end_date,
+      title: row.title,
+      summary: row.summary,
+      seed_ids: ranked[i][1]
+    }];
+  });
 }
 
 // 长尾兜底: 母帖第六节"只在前面全空时兜底"。

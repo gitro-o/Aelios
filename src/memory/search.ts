@@ -91,6 +91,9 @@ export function toMemoryApiRecord(
     last_injected_at: lc?.last_injected_at ?? null,
     version_status: record.version_status ?? (record.status === "superseded" ? "superseded" : "current"),
     superseded_by: record.superseded_by ?? lc?.superseded_by_id ?? null,
+    // LMC-5 E 轴 (0011，本体列)：亲笔署名与响应倾向，recall 排序加成用。
+    authored_by: record.authored_by ?? null,
+    response_tendency: record.response_tendency ?? null,
     ...(score === undefined ? {} : { score })
   };
 }

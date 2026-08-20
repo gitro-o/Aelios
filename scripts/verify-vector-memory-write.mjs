@@ -125,7 +125,10 @@ assert.match(recallSource, /min_score\?: number;/);
 assert.match(recallSource, /floored_ids: string\[\];\s+floored_count: number;\s+min_score: number;/);
 assert.match(recallSource, /const minScore = readRecallMinScore\(env, input\.min_score\);/);
 assert.match(recallSource, /const beforeFloor = \[\.\.\.afterRelation, \.\.\.longtailHits\]/);
-assert.match(recallSource, /if \(hit\.score >= minScore\) return true;\s+flooredIds\.push\(hit\.id\);/s);
+// #37: 地板判原始相关性分 (raw_score)，闸三降权只压排序。旧断言 (hit.score >= minScore)
+// 锁的是两闸相乘的病态形状，随修复一并更新。
+assert.match(recallSource, /if \(\(hit\.raw_score \?\? hit\.score\) >= minScore\) return true;\s+flooredIds\.push\(hit\.id\);/s);
+assert.match(recallSource, /raw_score: rawScore,/);
 assert.match(recallSource, /floored_ids: flooredIds,\s+floored_count: flooredIds\.length,\s+min_score: minScore,/s);
 assert.match(mcpSource, /min_score: \{ type: "number", minimum: 0, maximum: 1 \}/);
 assert.match(mcpSource, /min_score: typeof args\.min_score === "number" \? readNumber\(args\.min_score, 0\.15\) : undefined/);
