@@ -5,6 +5,7 @@ import {
 } from "../db/memories";
 import type { Env, MemoryApiRecord, MemoryLifecycleRow, MemoryRecord } from "../types";
 import { createEmbedding } from "./embedding";
+import { keepGroundedHits, mergeHybridRanks, tokenizeQuery } from "./queryShape";
 
 type MetadataMap = Record<string, unknown>;
 
@@ -104,10 +105,10 @@ function getTopK(env: Env, requested?: number): number {
   return Math.min(Math.max(value, 1), 200);
 }
 
-// Recall floor on the raw embedding score, applied BEFORE the reranker.
-// Kept low on purpose: embeddinggemma under-scores on-topic-but-reworded hits
-// (~0.15–0.20), so a high floor silently drops relevant memories. Precision is
-// owned downstream by the reranker + LLM compressor, not by this gate.
+// Absolute garbage floor on the raw embedding score, applied before ranking.
+// Kept low because embeddinggemma under-scores on-topic-but-reworded hits
+// (~0.15–0.20). Precision is keepGroundedHits: do not pad the list to topK
+// with centroid leftovers that only clear this floor.
 function getMinScore(env: Env): number {
   const value = Number(env.MEMORY_MIN_SCORE || 0.1);
   return Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 0.1;
@@ -372,18 +373,38 @@ export async function searchMemoriesWithProvenance(
     types?: string[];
     topK?: number;
     includeHistory?: boolean;
+    lexicalTokens?: string[];
     // When set (chat hot path), recall-count accounting is scheduled off the response path.
     waitUntil?: (promise: Promise<unknown>) => void;
+    // Explicit search defaults to true: do not pad topK with centroid leftovers.
+    // Auto-inject nomination sets false so the later reranker still sees paraphrases.
+    grounded?: boolean;
+    skipRecallMark?: boolean;
   }
 ): Promise<SearchMemoriesResult> {
   const topK = getTopK(env, input.topK);
-  const vectorOutcome = await searchWithVectorize(env, {
-    namespace: input.namespace,
-    query: input.query,
-    types: input.types,
-    topK,
-    includeHistory: input.includeHistory
-  });
+  const lexicalTokens = input.lexicalTokens ?? tokenizeQuery(input.query);
+  const [vectorOutcome, textRecords] = await Promise.all([
+    searchWithVectorize(env, {
+      namespace: input.namespace,
+      query: input.query,
+      types: input.types,
+      topK,
+      includeHistory: input.includeHistory
+    }),
+    searchMemoriesByText(env.DB, {
+      namespace: input.namespace,
+      query: input.query,
+      tokens: lexicalTokens,
+      types: input.types,
+      limit: Math.max(topK, 50),
+      includeHistory: input.includeHistory
+    })
+  ]);
+
+  const lexicalRecords = textRecords
+    .filter((record) => isRecallableMemory(record, { includeHistory: input.includeHistory }))
+    .map((record) => ({ ...record, backed: true as const }));
 
   let records: Array<MemoryRecord & { score: number; backed: boolean }>;
   let lifecycleByMemoryId = new Map<string, MemoryLifecycleRow | null>();
@@ -394,20 +415,35 @@ export async function searchMemoriesWithProvenance(
   }
 
   if (vectorOutcome && vectorOutcome.records.length > 0) {
-    records = vectorOutcome.records;
-    lifecycleByMemoryId = vectorOutcome.lifecycleByMemoryId;
+    // LMC-5 / Hindsight: vector and lexical run together, then RRF. Lexical is
+    // not a last-resort fallback — keyword hits must survive a noisy embedding.
+    records = mergeHybridRanks(vectorOutcome.records, lexicalRecords, topK);
+    lifecycleByMemoryId = new Map(vectorOutcome.lifecycleByMemoryId);
   } else {
     // D1 全文兜底: 结果本来就来自 memories 表, 天然全部有 D1 背书。
-    const textRecords = await searchMemoriesByText(env.DB, {
-      namespace: input.namespace,
-      query: input.query,
-      types: input.types,
-      limit: Math.max(topK, 50),
-      includeHistory: input.includeHistory
-    });
-    records = textRecords
-      .filter((record) => isRecallableMemory(record, { includeHistory: input.includeHistory }))
-      .map((record) => ({ ...record, backed: true }));
+    records = lexicalRecords.slice(0, topK);
+  }
+
+  // topK is a cap, not a quota. Explicit search drops centroid leftovers and
+  // 1-of-N lexical pads. Nomination for later reranking keeps the wider pool.
+  if (input.grounded !== false) {
+    records = keepGroundedHits(records, lexicalTokens, topK, { minScore: getMinScore(env) });
+  }
+
+  if (vectorOutcome && vectorOutcome.records.length > 0) {
+    const missingLifecycle = records
+      .map((record) => record.id)
+      .filter((id) => !lifecycleByMemoryId.has(id));
+    if (missingLifecycle.length > 0) {
+      const joined = await fetchMemoriesWithLifecycleByIds(env.DB, {
+        namespace: input.namespace,
+        ids: missingLifecycle
+      });
+      for (const { record, lifecycle } of joined) {
+        lifecycleByMemoryId.set(record.id, lifecycle);
+      }
+    }
+  } else {
     const joined = await fetchMemoriesWithLifecycleByIds(env.DB, {
       namespace: input.namespace,
       ids: records.map((record) => record.id)
@@ -415,14 +451,16 @@ export async function searchMemoriesWithProvenance(
     lifecycleByMemoryId = new Map(joined.map(({ record, lifecycle }) => [record.id, lifecycle]));
   }
 
-  const markPromise = markMemoriesRecalled(env.DB, {
-    namespace: input.namespace,
-    ids: records.map((record) => record.id)
-  });
-  if (input.waitUntil) {
-    input.waitUntil(markPromise);
-  } else {
-    await markPromise;
+  if (!input.skipRecallMark) {
+    const markPromise = markMemoriesRecalled(env.DB, {
+      namespace: input.namespace,
+      ids: records.map((record) => record.id)
+    });
+    if (input.waitUntil) {
+      input.waitUntil(markPromise);
+    } else {
+      await markPromise;
+    }
   }
 
   const apiRecords: MemoryApiRecordWithProvenance[] = records.map((record) => ({
@@ -443,7 +481,10 @@ export async function searchMemories(
     types?: string[];
     topK?: number;
     includeHistory?: boolean;
+    lexicalTokens?: string[];
     waitUntil?: (promise: Promise<unknown>) => void;
+    grounded?: boolean;
+    skipRecallMark?: boolean;
   }
 ): Promise<MemoryApiRecordWithProvenance[]> {
   const result = await searchMemoriesWithProvenance(env, input);

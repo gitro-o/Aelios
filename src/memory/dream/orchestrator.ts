@@ -5,6 +5,7 @@ import { newId } from "../../utils/ids";
 import { nowIso } from "../../utils/time";
 import { readString } from "../../utils/parse";
 import {
+  formatDreamCursor,
   getDateLabelsLookback,
   getDateRangeForLabel,
   getTargetDigestDateLabel,
@@ -21,6 +22,8 @@ import { runPerceptionPickPhase } from "../perception";
 import type { PerceptionPickStats } from "../perception";
 import { runRelationBuildPhase, runZAuditPhase } from "../relations";
 import type { RelationBuildStats, ZAuditStats } from "../relations";
+import { runTriggerBuildPhase } from "../triggers";
+import type { TriggerBuildStats } from "../triggers";
 import { listVectorMemories } from "../vectorStore";
 import { isV2Enabled } from "../v2/recall";
 import { runExtractPhase } from "./extractPhase";
@@ -106,7 +109,7 @@ export async function runDailyMemoryDigest(
   const cursorName = `dream:${namespace}:${dateLabel}`;
   const legacyCursorName = `daily_digest:${namespace}:${dateLabel}`;
   const cursor = (await readCursor(env.DB, cursorName)) ?? (await readCursor(env.DB, legacyCursorName));
-  const cursorState = options.force ? { done: false, after: null } : readDailyCursor(cursor, startIso, endIso);
+  const cursorState = options.force ? { done: false, after: null, afterId: null } : readDailyCursor(cursor, startIso, endIso);
   if (cursorState.done) {
     await safeFinishDreamRun(env.DB, {
       id: dreamRunId,
@@ -122,6 +125,7 @@ export async function runDailyMemoryDigest(
     startCreatedAt: startIso,
     endCreatedAt: endIso,
     afterCreatedAt: cursorState.after,
+    afterId: cursorState.afterId,
     limit: maxMessages
   });
   if (fetchedMessages.length === 0) {
@@ -206,8 +210,8 @@ export async function runDailyMemoryDigest(
     };
   }
 
-  if (extractPhase.extractReason === "model_error") {
-    console.error("dream: extract model failed; cursor not advanced", {
+  if (extractPhase.extractReason) {
+    console.error("dream: extract failed; cursor not advanced", {
       date: dateLabel,
       reason: extractPhase.extractReason,
       model: extractPhase.extractModel,
@@ -216,18 +220,18 @@ export async function runDailyMemoryDigest(
     await safeFinishDreamRun(env.DB, {
       id: dreamRunId,
       status: "error",
-      reason: "extract_model_error",
+      reason: extractPhase.extractReason === "model_invalid_json" ? "extract_invalid_json" : "extract_model_error",
       model: extractPhase.extractModel ?? modelResult.model,
       processedMessages: messages.length,
       error: extractPhase.extractStatus
         ? `status=${extractPhase.extractStatus}`
-        : "model_error"
+        : extractPhase.extractReason
     });
     return {
       ran: false,
       mode: "dream",
       date: dateLabel,
-      reason: "extract_model_error",
+      reason: extractPhase.extractReason === "model_invalid_json" ? "extract_invalid_json" : "extract_model_error",
       startIso,
       endIso,
       cursor,
@@ -323,6 +327,23 @@ export async function runDailyMemoryDigest(
     });
   }
 
+  // 触发器建期。和上面的 relation-build 一样单独隔离：这一步烧模型调用，
+  // 失败不该把整夜的整理一起拖掉。TRIGGER_BUILD 默认 off，关着时它立刻返回。
+  let triggerBuild: TriggerBuildStats | undefined;
+  try {
+    triggerBuild = await runTriggerBuildPhase(env, {
+      namespace,
+      startIso,
+      endIso
+    });
+  } catch (error) {
+    console.error("dream: trigger-build phase failed", {
+      namespace,
+      date: dateLabel,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+
   let zAudit: ZAuditStats | undefined;
   try {
     zAudit = await runZAuditPhase(env, {
@@ -380,12 +401,19 @@ export async function runDailyMemoryDigest(
     });
   }
 
-  await writeCursor(env.DB, cursorName, hasMore ? lastMessage.created_at : `done:${lastMessage.created_at}`);
+  await writeCursor(env.DB, cursorName, formatDreamCursor({
+    done: !hasMore,
+    createdAt: lastMessage.created_at,
+    id: lastMessage.id
+  }));
 
   // LMC-5 phase report is additive audit data — never stuff into dream_runs.error
   // (legacy shape is JSON array of apply errors, or null). Persist via memory_events.
   const hasLmc5Report =
-    relationBuild !== undefined || zAudit !== undefined || perception !== undefined;
+    relationBuild !== undefined ||
+    zAudit !== undefined ||
+    perception !== undefined ||
+    triggerBuild !== undefined;
   if (hasLmc5Report) {
     try {
       await env.DB
@@ -400,6 +428,7 @@ export async function runDailyMemoryDigest(
           JSON.stringify({
             date: dateLabel,
             relation_build: relationBuild ?? null,
+            trigger_build: triggerBuild ?? null,
             z_audit_pairs: zAudit?.pairs ?? [],
             z_audit: zAudit
               ? {

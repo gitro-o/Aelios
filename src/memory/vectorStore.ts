@@ -3,7 +3,10 @@ import { newId } from "../utils/ids";
 import { clampScore, parseStringArray, readString } from "../utils/parse";
 import { nowIso } from "../utils/time";
 import { createEmbedding } from "./embedding";
+import { deleteFtsRow, upsertMemoryFts } from "./fts";
 import { clampMemoryType } from "./canonicalTypes";
+import { deleteTriggersForMemory } from "../db/v2";
+import { deleteTriggerVectors } from "./triggers/store";
 
 type MetadataMap = Record<string, unknown>;
 
@@ -227,6 +230,7 @@ async function insertMemoryRecord(env: Env, record: MemoryRecord): Promise<void>
 
   if (!isLifecycleEnabled(env)) {
     await memoryInsert.run();
+    await upsertMemoryFts(env.DB, { namespace: record.namespace, memoryId: record.id, content: record.content });
     return;
   }
 
@@ -240,6 +244,7 @@ async function insertMemoryRecord(env: Env, record: MemoryRecord): Promise<void>
     .bind(record.id, record.namespace, record.created_at);
 
   await env.DB.batch([memoryInsert, lifecycleInsert]);
+  await upsertMemoryFts(env.DB, { namespace: record.namespace, memoryId: record.id, content: record.content });
 }
 
 async function getVectorsByIdsBatched(
@@ -313,6 +318,15 @@ async function updateMemoryRecord(env: Env, record: MemoryRecord): Promise<Memor
     )
     .run();
 
+  if (record.status === "deleted" || record.status === "archived" || record.status === "expired") {
+    await deleteFtsRow(env.DB, "memory_fts", "memory_id", record.id);
+  } else {
+    await upsertMemoryFts(env.DB, {
+      namespace: record.namespace,
+      memoryId: record.id,
+      content: `${record.content}\n${record.summary ?? ""}`
+    });
+  }
   return getMemoryRecordById(env, record.id);
 }
 
@@ -321,6 +335,7 @@ async function markMemoryRecordDeleted(env: Env, input: { namespace: string; id:
     .prepare("UPDATE memories SET status = 'deleted', updated_at = ? WHERE namespace = ? AND id = ?")
     .bind(input.updatedAt, input.namespace, input.id)
     .run();
+  await deleteFtsRow(env.DB, "memory_fts", "memory_id", input.id);
 }
 
 export async function createVectorMemory(env: Env, input: VectorMemoryInput): Promise<MemoryApiRecord> {
@@ -407,6 +422,16 @@ export async function deleteVectorMemory(env: Env, id: string): Promise<boolean>
     } catch (error) {
       console.error("memory vector delete failed after D1 delete", { id, error });
     }
+  }
+
+  // 记忆删了，挂在它上面的触发器也得摘掉，否则留下一批指向空记录的孤儿——
+  // 召回侧的 D1 背书检查会挡住它们，但它们仍然白占触发器索引的 topK 名额。
+  // 与向量删除同样的处理：失败只记日志，不回滚已经完成的 D1 删除。
+  try {
+    const staleTriggers = await deleteTriggersForMemory(env.DB, id);
+    await deleteTriggerVectors(env, staleTriggers);
+  } catch (error) {
+    console.error("trigger cleanup failed after memory delete", { id, error });
   }
   return true;
 }

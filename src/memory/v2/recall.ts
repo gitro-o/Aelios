@@ -1,9 +1,9 @@
 // Aelios 记忆库 v2 召回管线 (母帖 #11 第 2/3 步)
 // boot: 冷启动包 (L1 摘要 + 昨天日志 + top pinned 珍贵)，输出稳定、确定性排序。
-// recall: 每轮动态召回 (黑话词面 → memories 向量 → world_fact → 长尾兜底)，闸三降权。
+// recall: 每轮动态召回 (黑话词面 → memories 向量+词面 RRF → world_fact → 长尾兜底)，闸三降权。
 //
 // 召回逻辑优先级 (母帖第三节，非物理摆放):
-//   词面命中(黑话) → 核心(L1 摘要 + 命中珍贵) → 重要记忆+世界知识(向量) → 全空才落长尾
+//   词面命中(黑话) → 核心(L1 摘要 + 命中珍贵) → 重要记忆+世界知识(混合检索) → 全空才落长尾
 //
 // 去重三闸:
 //   闸一: 珍贵不进每轮 query 召回池，归 boot 固定供给 (这里 recall 不查 precious)。
@@ -27,9 +27,14 @@ import { searchMemoriesWithProvenance } from "../search";
 import type { MemoryApiRecordWithProvenance } from "../search";
 import { filterAndCompressMemories } from "../filter";
 import { createEmbedding } from "../embedding";
+import { shapeRecallQuery } from "../queryShape";
 import { expandRecallByRelations, isRelationExpansionEnabled } from "../relations";
+import { fetchTriggeredRecords, isTriggerRecallEnabled, recallByTriggers } from "../triggers";
 import type { RelationExpansionMeta } from "../relations";
 import { loadSpontaneousForBoot } from "../perception";
+import { getYesterdayDateLabel } from "../dreamDates";
+import { readDreamTimeZone } from "../dreamEnv";
+import { formatDateLabel } from "../../utils/time";
 import type { Env, PerceptionCacheItem } from "../../types";
 import {
   fatigueAlpha,
@@ -90,12 +95,7 @@ function weekBlockLimit(env: Env): number {
 function dateLabelInTimeZone(iso: string, timeZone: string): string | null {
   const ts = Date.parse(iso);
   if (!Number.isFinite(ts)) return null;
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).format(new Date(ts));
+  return formatDateLabel(new Date(ts), timeZone);
 }
 
 function decayForLastInjected(
@@ -212,12 +212,8 @@ export async function buildBootPackage(
     return cached.value;
   }
 
-  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const bootTimeZone = env.DREAM_TIME_ZONE || "Asia/Shanghai";
-  const yesterdayLabel = new Intl.DateTimeFormat("en-CA", {
-    timeZone: bootTimeZone,
-    year: "numeric", month: "2-digit", day: "2-digit"
-  }).format(yesterday);
+  const bootTimeZone = readDreamTimeZone(env);
+  const yesterdayLabel = getYesterdayDateLabel(bootTimeZone);
 
   const [preciousRows, allGlossary, dailyLog, weeklyRows, monthlyRows, spontaneous] = await Promise.all([
     input.preciousRows
@@ -315,6 +311,8 @@ async function listAllGlossary(
 export interface RecallInput {
   namespace: string;
   query: string;
+  // Prior human turns. Thin queries ("那个呢") reuse this as embedding context.
+  recent?: string[];
   k?: number;
   types?: string[];
   min_score?: number;
@@ -329,6 +327,12 @@ export interface RecallInput {
   exclude_weeks?: string[];
   // When set (chat hot path), injection accounting is scheduled off the response path.
   waitUntil?: (promise: Promise<unknown>) => void;
+  // Gateway applies the unified surface budget first, then marks only those ids.
+  skip_inject_mark?: boolean;
+  // False = nomination pool for a later reranker. Default true for explicit search.
+  grounded?: boolean;
+  // Week diaries are impressions, not evidence. Only attach when the question is temporal.
+  attach_week_blocks?: boolean;
 }
 
 export interface RecallHit {
@@ -351,6 +355,11 @@ export interface RecallHit {
   // E 轴: 亲笔署名与响应倾向 (0011)。authored 命中吃排序加成，供面板观察。
   authored_by?: string | null;
   response_tendency?: string | null;
+  // Keep recording time separate from effective/event time for evidence selection.
+  recorded_date?: string | null;
+  event_date?: string | null;
+  fact_key?: string | null;
+  source_message_ids?: string[];
   // LMC-5 Y 轴 (additive, only when RELATION_EXPANSION on and hit came via edge)
   relation?: RelationExpansionMeta;
   contradicted_by?: string[];
@@ -403,32 +412,71 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
   }
   const minScore = readRecallMinScore(env, input.min_score);
 
+  const shaped = shapeRecallQuery({ query, recent: input.recent });
+  const glossaryQuery = shaped.thin
+    ? [query, ...(input.recent ?? [])].filter(Boolean).join("\n")
+    : query;
+
   // 1. 黑话词面命中 (L5，不进向量，走词面)
   const glossaryRows = await matchGlossary(env.DB, {
     namespace: input.namespace,
-    query
+    query: glossaryQuery
   });
   const glossaryHits = glossaryRows.map((r) => ({ term: r.term, definition: r.definition }));
 
-  // 2. memories 向量召回 (L4 + L6 world_fact，active only)
+  // 2. memories 混合召回 (向量 + 词面 RRF，L4 + L6 world_fact，active only)
   //    闸一: 不查 precious。precious 归 boot 固定供给, 不进每轮 query 召回池。
-  const k = Math.min(Math.max(Math.floor(input.k ?? 3), 1), 100);
+  const k = Math.min(Math.max(Math.floor(input.k ?? 8), 1), 100);
   const searchResult = await searchMemoriesWithProvenance(env, {
     namespace: input.namespace,
-    query,
+    query: shaped.embeddingQuery,
+    lexicalTokens: shaped.lexicalTokens,
     types: input.types,
     topK: k,
     includeHistory: input.include_history === true,
-    waitUntil: input.waitUntil
+    waitUntil: input.waitUntil,
+    grounded: input.grounded !== false,
+    skipRecallMark: input.skip_inject_mark === true || input.grounded === false
   });
-  const rawMemories: MemoryApiRecordWithProvenance[] = searchResult.records;
+  // 复制一份：下面触发器通道会往池子里 push，不要改到 searchResult 自己的数组。
+  const rawMemories: MemoryApiRecordWithProvenance[] = [...searchResult.records];
+
+  // 2.25 触发器通道 (入口扩展，默认 off)。
+  // 与 4.5 的 relation 扩展分工：那边从已召回的种子往外走，是出口扩展，种子为空时
+  // 它什么也做不了；这边把本来进不了候选池的记忆送进来——问题和记忆语义相关但几乎
+  // 不共享词汇的那一类，主检索第一跳就空了，触发器是唯一还能把它捞回来的路。
+  //
+  // 只 union，不改已有命中的分和顺序。新进来的记忆和别的候选一样，要过 2.5 的
+  // reranker 和闸四才算数——这条通道负责"让它有机会被看见"，不负责"让它赢"。
+  if (isTriggerRecallEnabled(env)) {
+    try {
+      const outcome = await recallByTriggers(env, {
+        namespace: input.namespace,
+        query: shaped.embeddingQuery
+      });
+      if (outcome.triggered) {
+        const extra = await fetchTriggeredRecords(env, {
+          namespace: input.namespace,
+          outcome,
+          existingIds: new Set(rawMemories.map((m) => m.id)),
+          includeHistory: input.include_history === true
+        });
+        rawMemories.push(...extra);
+      }
+    } catch (error) {
+      console.error("trigger recall failed; using seed pool", error);
+    }
+  }
   // 严格模式下 (RECALL_REQUIRE_D1_BACKING=true) 已经在 search 层丢弃的孤儿向量命中数。
   const unbackedDropped = searchResult.unbacked_dropped;
 
-  // 2.5. 召回精炼: prepareCandidates + reranker，记忆原文直出
+  // 2.5. Rank with the reranker, but do not apply the auto-injection
+  // 2-item budget here. MCP / REST active recall needs the full k;
+  // the gateway surface trims after this.
   const memories = (await filterAndCompressMemories(env, {
     query,
-    memories: rawMemories
+    memories: rawMemories,
+    maxOutput: k
   })) as MemoryApiRecordWithProvenance[];
 
   // 3. 闸三: last_injected_at 近期注入过的降权 (不动 importance)。
@@ -461,7 +509,11 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
       backed: m.backed,
       kind: "memory" as const,
       authored_by: authored,
-      response_tendency: m.response_tendency ?? null
+      response_tendency: m.response_tendency ?? null,
+      recorded_date: m.created_at ?? null,
+      event_date: m.valid_as_of ?? null,
+      fact_key: m.fact_key ?? null,
+      source_message_ids: m.source_message_ids
     };
   });
 
@@ -518,6 +570,9 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
   const flooredIds: string[] = [];
   const allHits = beforeFloor
     .filter((hit) => {
+      // Nomination pools stay wide for the later reranker. Explicit search
+      // still drops scores that only cleared the padded lexical floor.
+      if (input.grounded === false) return true;
       if ((hit.raw_score ?? hit.score) >= minScore) return true;
       flooredIds.push(hit.id);
       return false;
@@ -529,7 +584,7 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
   const memoryIdsToMark = allHits
     .filter((h) => h.source_layer === "memory")
     .map((h) => h.id);
-  if (memoryIdsToMark.length > 0) {
+  if (memoryIdsToMark.length > 0 && !input.skip_inject_mark) {
     const markPromise = markMemoriesInjected(env.DB, {
       namespace: input.namespace,
       ids: memoryIdsToMark
@@ -543,7 +598,7 @@ export async function runRecall(env: Env, input: RecallInput): Promise<RecallRes
 
   // 7. #35 周块附带。失败不影响召回主体，吞掉记日志。
   let weekBlocks: RecallWeekBlock[] = [];
-  if (isWeekBlockEnabled(env) && allHits.length > 0) {
+  if (isWeekBlockEnabled(env) && allHits.length > 0 && input.attach_week_blocks !== false) {
     try {
       weekBlocks = await collectWeekBlocks(env, {
         namespace: input.namespace,
@@ -596,7 +651,7 @@ export async function collectWeekBlocks(
     excludeWeeks?: string[];
   }
 ): Promise<RecallWeekBlock[]> {
-  const timeZone = env.DREAM_TIME_ZONE || "Asia/Shanghai";
+  const timeZone = readDreamTimeZone(env);
 
   const seedsByWeek = new Map<string, string[]>();
   for (const hit of input.hits) {

@@ -1,4 +1,6 @@
 export interface Env {
+  GATEWAY_CONFIG?: string;
+  AI_GATEWAY_ID?: string;
   DB: D1Database;
   AI?: Ai;
   MEMORY_QUEUE?: Queue<QueueMessage>;
@@ -11,13 +13,14 @@ export interface Env {
   DEFAULT_UPSTREAM_MODEL?: string;
   ALLOW_MODEL_PASSTHROUGH?: string;
   AI_GATEWAY_BASE_URL?: string;
+  /** Comma-separated tool-definition fields to strip before every upstream send. */
+  UPSTREAM_STRIP_TOOL_FIELDS?: string;
   CHATBOX_API_KEY?: string;
   IM_API_KEY?: string;
   DEBUG_API_KEY?: string;
   MEMORY_MCP_API_KEY?: string;
   GUIDE_DOG_API_KEY?: string;
   CF_AIG_TOKEN?: string;
-  ENABLE_AUTO_MEMORY?: string;
   ENABLE_DREAM?: string;
   // --- Aelios 记忆库 v2 行为开关 ---
   // 默认走 v2；只有显式 false 才回退旧路径。
@@ -32,7 +35,7 @@ export interface Env {
   MEMORY_PATROL_DRY_RUN?: string;
   // 是否允许自动删（默认 false 锁死）
   MEMORY_AUTO_DELETE?: string;
-  // 闸三降权窗口 (分钟)，默认 240
+  // 闸三降权窗口 (分钟)，默认 30
   MEMORY_INJECT_DECAY_WINDOW_MIN?: string;
   // 闸三降权系数 (0-1)，默认 0.35
   MEMORY_INJECT_DECAY_FACTOR?: string;
@@ -54,6 +57,12 @@ export interface Env {
   // LMC-5 Y 轴: 2-hop relation expansion. Default off (undefined/"off"/"false") = recall identical to pre-LMC5.
   // Set "on" or "true" to enable hop1/hop2 expansion after vector seed hits.
   RELATION_EXPANSION?: string;
+  // Trigger 召回通道 (migration 0016)。默认全 off；gate 调低会往候选池灌噪音。
+  TRIGGER_RECALL?: string;
+  TRIGGER_RECALL_GATE?: string;
+  TRIGGER_RECALL_TOP_K?: string;
+  TRIGGER_BUILD?: string;
+  TRIGGER_BUILD_MODEL?: string;
   ENABLE_DAILY_MEMORY_DIGEST?: string;
   DREAM_NAMESPACE?: string;
   DREAM_MAX_MESSAGES?: string;
@@ -81,10 +90,10 @@ export interface Env {
   ENABLE_DIARY_WRITER?: string;
   DIARY_MODEL?: string;
   DEDUP_COSINE?: string;
-  // L4 每区（type）active 条数硬上限，0 或不设 = 关闭（母帖第一节，对抗膨胀的闸）
-  MEMORY_ZONE_CAP?: string;
-  // 候选队列自动评审（judge），默认关闭
+  // 候选队列自动评审（judge），默认开启；设 "false" 关闭
   CANDIDATE_JUDGE_ENABLED?: string;
+  // on/true = 每天夜整完用 Cloudflare 的 clef 审候选，只分记住和放下，盖过自审和代审。默认关。
+  CLEF_AUTO_REVIEW?: string;
   JUDGE_MODEL?: string;
   JUDGE_MAX_CANDIDATES?: string;
   // judge 评分阈值：>= APPROVE_MIN 自动入库，<= DISCARD_MAX 自动丢弃，中间留人工
@@ -104,7 +113,6 @@ export interface Env {
   GITHUB_DAILY_TOKEN?: string;
   EMPTY_MEMORY_MIN_CHARS?: string;
   MESSAGES_RETENTION_DAYS?: string;
-  MEMORY_MODE?: string;
   ENABLE_MEMORY_FILTER?: string;
   ENABLE_MEMORY_RERANKER?: string;
   MEMORY_RERANKER_MODEL?: string;
@@ -114,27 +122,14 @@ export interface Env {
   MEMORY_FILTER_MAX_CONTENT_CHARS?: string;
   MEMORY_FILTER_MIN_SCORE?: string;
   MEMORY_FILTER_FAIL_OPEN?: string;
-  MEMORY_EXTRACT_EVERY_N_MESSAGES?: string;
-  INJECTION_MODE?: string;
+  RECALL_RERANK_MIN_SCORE?: string;
+  RECALL_RERANK_TIMEOUT_MS?: string;
   EMBEDDING_MODEL?: string;
   EMBEDDING_DIMENSIONS?: string;
   MEMORY_TOP_K?: string;
   MEMORY_MIN_SCORE?: string;
   MEMORY_LEGACY_VECTOR_FALLBACK_LIMIT?: string;
   MEMORY_LEGACY_VECTOR_FALLBACK_SCORE_FACTOR?: string;
-  ANTHROPIC_CACHE_ENABLED?: string;
-  ANTHROPIC_CACHE_TTL?: string;
-  ANTHROPIC_AUTO_CACHE_ENABLED?: string;
-  ANTHROPIC_ROLLING_CACHE_ENABLED?: string;
-  ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE?: string;
-  ANTHROPIC_CACHE_STABLE_SYSTEM?: string;
-  ANTHROPIC_CACHE_USER_ID?: string;
-  CUSTOM_ANTHROPIC_MESSAGES_PATH?: string;
-  ANTHROPIC_THINKING_ENABLED?: string;
-  ANTHROPIC_THINKING_BUDGET?: string;
-  ENABLE_CACHE_API?: string;
-  CACHE_DEFAULT_TTL_SECONDS?: string;
-  CACHE_MAX_VALUE_BYTES?: string;
 }
 
 export interface RetentionQueueMessage {
@@ -142,7 +137,7 @@ export interface RetentionQueueMessage {
   namespace: string;
 }
 
-export type QueueMessage = RetentionQueueMessage;
+export type QueueMessage = RetentionQueueMessage | import("./gateway/record").GatewayExchange;
 
 export type Scope =
   | "chat:proxy"
@@ -153,17 +148,15 @@ export type Scope =
   | "debug:read"
   | "export:read";
 
-export type InjectionMode = "rag" | "full" | "hybrid" | "none";
-export type MemoryMode = "external" | "builtin" | "hybrid" | "none";
 
 export interface KeyProfile {
   source: string;
   namespace: string;
   scopes: Scope[];
-  injectionMode: InjectionMode;
-  memoryMode: MemoryMode;
   allowModelPassthrough: boolean;
   debug: boolean;
+  /** Owner keys may address any namespace via ?namespace= / body.namespace; others stay pinned. */
+  chooseNamespace: boolean;
 }
 
 export interface AuthResult {
@@ -235,6 +228,8 @@ export interface MessageRecord {
   content: string;
   source: string | null;
   created_at: string;
+  /** Turn-local order. Hash IDs are unique only; same-timestamp rows sort by seq. */
+  seq?: number;
 }
 
 export type MemoryVersionStatus = "current" | "superseded" | "under_review";
@@ -351,4 +346,3 @@ export interface PerceptionCacheRow {
   items: string;
   created_at: string;
 }
-
