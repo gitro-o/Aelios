@@ -35,7 +35,19 @@ const INTERNAL: Record<string, string> = {
   DAILY_DIGEST_MAX_TOKENS: 'readDreamMaxTokens 的旧名兜底',
   DAILY_DIGEST_MEMORY_CONTEXT_LIMIT: 'readDreamMemoryContextLimit 的旧名兜底',
   DAILY_DIGEST_MAX_RUNS: 'DREAM_MAX_RUNS 的旧名兜底',
-  ENABLE_DAILY_MEMORY_DIGEST: 'isDreamEnabled 的旧名兜底，ENABLE_DREAM 优先'
+  ENABLE_DAILY_MEMORY_DIGEST: 'isDreamEnabled 的旧名兜底，ENABLE_DREAM 优先',
+  DREAM_ARCHIVE_DELETES_TO_LONGTAIL: 'dream 删除旧记忆是否收容进 longtail，我们默认 false',
+  MEMORY_WRITE_MODE: '写入模式：默认 upsert，可显式 append',
+  MEMORY_PATROL_DRY_RUN: 'patrol 是否只出提案不自动删',
+  MEMORY_AUTO_DELETE: '是否允许自动删，默认 false 锁死',
+  ENABLE_EXTRACT: '独立抽取阶段开关，我们关闭',
+  EXTRACT_MODEL: 'extract 阶段用的模型',
+  EXTRACT_MAX_MESSAGES: 'extract 一次最多处理的消息数',
+  EXTRACT_MAX_RUNS: 'extract 最多跑几轮',
+  EXTRACT_MAX_TOKENS: 'extract 输出 token 上限',
+  EXTRACT_REVIEW_CONFIDENCE: 'extract 自审置信阈值',
+  MEMORY_SEARCH_MARK_TOP: '轮休重排后记账 last_injected_at 的头部条数，wrangler.toml 有默认',
+  MEMORY_FATIGUE_ALPHA: '过曝疲劳系数，wrangler.toml 有默认'
 };
 
 function sourceFiles(dir: string): string[] {
