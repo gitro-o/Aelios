@@ -5,8 +5,6 @@ export const KEY_PROFILES = {
     source: "chatbox",
     namespace: "default",
     scopes: ["chat:proxy", "memory:read", "memory:write", "cache:read", "cache:write", "export:read"],
-    injectionMode: "rag",
-    memoryMode: "external",
     allowModelPassthrough: false,
     debug: false,
     chooseNamespace: true
