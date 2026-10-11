@@ -6,7 +6,7 @@ import { timingSafeEqual } from "node:crypto";
 import worker from "../src/index";
 import { identityNamespace, identityReadNamespaces, invalidateSettingsCache, speakersForNamespace, validateConfig } from "../src/gateway/config";
 import { appendMemory, classifyTurn, canonical } from "../src/gateway/protocol";
-import { catalogUrl, resolveUpstream, routeFor, rejectedToolFields } from "../src/gateway/upstream";
+import { catalogUrl, nativeAnthropic, resolveUpstream, routeFor, rejectedToolFields } from "../src/gateway/upstream";
 import { OutputCollector, observeResponse, persistExchange, prepareExchange, dispatchExchange } from "../src/gateway/record";
 
 import { lexicalOverlapScore, shapeRecallQuery } from "../src/memory/queryShape";
@@ -757,6 +757,64 @@ test("messages on CF strips the provider prefix and carries the token as cf-aig-
   assert.equal(calls[0].headers["anthropic-version"], "2023-06-01");
 });
 
+test("default thinking mode keeps the tool loop after an injected turn working on Anthropic's own line", async () => {
+  // 2026-10-08: remember called right after a recalled turn, the continuation came back 400
+  // "Invalid signature in thinking block. The block is bound to a different conversation".
+  precious("partner-a", "Cloudflare fan");
+  const plain: any = identity();
+  delete plain.anthropicThinking;
+  setConfig({ ...config([plain]), upstream: { address: "e".repeat(32) } });
+  const user = { role: "user", content: "Cloudflare" };
+  const body = { model: "anthropic/claude-opus-5-5", max_tokens: 2048, messages: [user] };
+  await run("/v1/messages", body);
+  assert.match(calls[0].query.messages[0].content, /Cloudflare fan/);
+  assert.equal(calls[0].query.thinking, undefined);
+  assert.equal(calls[0].headers["anthropic-beta"], undefined);
+  const generated = { role: "assistant", content: [{ type: "thinking", thinking: "", signature: "bound-to-injected-prefix" },
+    { type: "tool_use", id: "r", name: "remember", input: { content: "fact" } }] };
+  const continuation = { ...body, messages: [user, generated, { role: "user", content: [{ type: "tool_result", tool_use_id: "r", content: "saved" }] }] };
+  await run("/v1/messages", continuation);
+  assert.deepEqual(calls[1].query.messages, continuation.messages);
+  assert.deepEqual(calls[1].query.thinking, { type: "adaptive", block_binding: { prefix_mismatch_behavior: "drop_block" } });
+  assert.match(calls[1].headers["anthropic-beta"], /thinking-binding-controls-2026-08-01/);
+  // The same identity on a relay line is left as the client sent it.
+  setConfig(config([plain]));
+  await run("/v1/messages", { ...continuation, model: "partner", thinking: { type: "adaptive" } });
+  assert.deepEqual(calls[2].query.thinking, { type: "adaptive" });
+  assert.equal(calls[2].headers["anthropic-beta"], undefined);
+  const resolved = resolveUpstream({} as any, { version: 3, upstream: { address: "e".repeat(32) }, identities: [] });
+  assert.equal(nativeAnthropic(routeFor(resolved, "messages", "anthropic/claude-opus-5-5")), true);
+  for (const model of ["google-vertex-ai/claude-opus-5-5", "custom-navy/claude-opus-5-5", "openrouter/anthropic/claude-opus-5-5"]) {
+    assert.equal(nativeAnthropic(routeFor(resolved, "messages", model)), false, model);
+  }
+});
+
+test("a model that refuses the guessed thinking gets the request exactly as the client sent it", async () => {
+  // Opus wrote the signed history, then the chat switched to a model without adaptive thinking.
+  const plain: any = { ...identity(), models: ["*haiku*"] };
+  delete plain.anthropicThinking;
+  setConfig({ ...config([plain]), upstream: { address: "e".repeat(32) } });
+  const mock = globalThis.fetch;
+  globalThis.fetch = async (url: any, init: any) => {
+    const query = JSON.parse(init.body);
+    if (query.thinking?.type === "adaptive") {
+      calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init.headers)), query });
+      return Response.json({ type: "error", error: { type: "invalid_request_error", message: "adaptive thinking is not supported on this model" } }, { status: 400 });
+    }
+    return mock(url, init);
+  };
+  const body = { model: "anthropic/claude-haiku-4-5", max_tokens: 64, messages: [{ role: "user", content: "hi" },
+    { role: "assistant", content: [{ type: "thinking", thinking: "", signature: "opus" }, { type: "text", text: "hello" }] },
+    { role: "user", content: "again" }] };
+  const { response } = await run("/v1/messages", body, { "anthropic-beta": "client-beta" });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].query.thinking.type, "adaptive");
+  assert.equal(calls[1].query.thinking, undefined);
+  assert.equal(calls[1].headers["anthropic-beta"], "client-beta");
+  assert.deepEqual(calls[1].query.messages.slice(0, 2), body.messages.slice(0, 2));
+});
+
 test("any provider gets a native messages/responses route; prefixless models are refused before any upstream call", async () => {
   setConfig({ ...config(), upstream: { address: "d".repeat(32) } });
   await run("/v1/messages", { model: "openrouter/anthropic/claude-haiku-4.5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] });
@@ -790,6 +848,42 @@ test("settings edited in the admin page override deployment vars everywhere", as
   assert.equal(report.secrets.find((x: any) => x.name === "DEBUG_API_KEY").present, false);
   assert.equal((await worker.fetch(request("/api/gateway/env", undefined, { authorization: "Bearer im-key" }), env, ctx)).status, 401);
   assert.throws(() => validateConfig({ ...config(), settings: { DB: "hijacked" } }), /Unknown setting/);
+});
+
+test("settings page saves one item at a time without touching the rest of the config", async () => {
+  const start = { ...config(), upstream: { address: "https://keep.test/v1" }, settings: { CHAT_MODEL: "kept", DREAM_MODEL: "old-dream" } };
+  assert.equal((await worker.fetch(request("/api/gateway/config", start, {}, "PUT"), env, ctx)).status, 200);
+  // One switch flipped: only that key changes; "" drops a key back to the deployed value.
+  const patched = await worker.fetch(request("/api/gateway/config", { settings: { CLEF_AUTO_REVIEW: "true", DREAM_MODEL: "" } }, {}, "PATCH"), env, ctx);
+  assert.equal(patched.status, 200);
+  assert.deepEqual((await patched.json() as any).settings, { CHAT_MODEL: "kept", CLEF_AUTO_REVIEW: "true" });
+  let saved = JSON.parse((await run("/api/gateway/config")).text);
+  assert.deepEqual(saved.settings, { CHAT_MODEL: "kept", CLEF_AUTO_REVIEW: "true" });
+  assert.equal(saved.upstream.address, "https://keep.test/v1");
+  assert.equal(saved.identities[0].slug, "partner");
+  // Saving the assistants leaves every setting alone; upstream: null removes it.
+  const renamed = [{ ...identity(), userName: "小南" }];
+  assert.equal((await worker.fetch(request("/api/gateway/config", { identities: renamed, upstream: null }, {}, "PATCH"), env, ctx)).status, 200);
+  saved = JSON.parse((await run("/api/gateway/config")).text);
+  assert.deepEqual(saved.settings, { CHAT_MODEL: "kept", CLEF_AUTO_REVIEW: "true" });
+  assert.equal(saved.identities[0].userName, "小南");
+  assert.equal(saved.upstream, undefined);
+  // Bad patches are refused whole and change nothing.
+  for (const bad of [{ settings: { DB: "hijacked" } }, { identities: "nope" }, [1]]) {
+    assert.equal((await worker.fetch(request("/api/gateway/config", bad, {}, "PATCH"), env, ctx)).status, 400);
+  }
+  assert.deepEqual(JSON.parse((await run("/api/gateway/config")).text).settings, { CHAT_MODEL: "kept", CLEF_AUTO_REVIEW: "true" });
+  assert.equal((await worker.fetch(request("/api/gateway/config", { settings: {} }, { authorization: "Bearer im-key" }, "PATCH"), env, ctx)).status, 401);
+  // The env report tells the page which items are switches, their code default, and which are everyday ones.
+  invalidateSettingsCache();
+  const items = JSON.parse((await run("/api/gateway/env")).text).groups.flatMap((g: any) => g.items);
+  const clef = items.find((i: any) => i.name === "CLEF_AUTO_REVIEW");
+  assert.equal(clef.kind, "switch");
+  assert.equal(clef.defaultOn, true);
+  assert.equal(clef.common, true);
+  assert.equal(clef.value, "true");
+  assert.equal(items.find((i: any) => i.name === "ENABLE_DREAM").defaultOn, true);
+  assert.equal(items.find((i: any) => i.name === "CHAT_MODEL").kind, undefined);
 });
 
 test("read-space configuration is backwards compatible, bounded, explicit and round-trips via admin", async () => {
@@ -1041,4 +1135,17 @@ test("keeping a candidate back to pending does not wipe its target memory link",
   });
   assert.equal(cleared?.target_memory_id, null);
   assert.equal(cleared?.decision_note, "judge: 说不准，留给人工");
+});
+
+test("the settings page can see how many memories each space holds", async () => {
+  const add = sqlite.prepare(`INSERT INTO memories (id, namespace, type, content, status, importance, confidence, created_at, updated_at)
+    VALUES (?, ?, 'fact', ?, ?, 1, 1, '2026-09-06', '2026-09-06')`);
+  add.run("d1", "default", "咲咲住在武汉", "active");
+  add.run("d2", "default", "咲咲喜欢越南咖啡", "active");
+  add.run("d3", "default", "旧的住址", "archived");
+  add.run("p1", "partner", "partner fact", "active");
+  const { response, text } = await run("/api/gateway/spaces");
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse(text).spaces, [{ namespace: "default", memories: 2 }, { namespace: "partner", memories: 1 }]);
+  assert.equal((await worker.fetch(request("/api/gateway/spaces", undefined, { authorization: "Bearer im-key" }), env, ctx)).status, 401);
 });
