@@ -27,6 +27,8 @@ import {
   handleDiaryApi
 } from "./api/memories";
 import { handleMcp } from "./api/mcp";
+import { handleNotebookApi } from "./api/notebook";
+import { handleImportApi } from "./api/transfer";
 import { handleModels } from "./api/models";
 import { handleRelationsGraph } from "./api/relations";
 import { runCandidateJudge } from "./memory/candidateJudge";
@@ -184,12 +186,20 @@ export default {
       return handleGlossaryApi(request, env);
     }
 
+    if (url.pathname === "/v1/notebook" || url.pathname.startsWith("/v1/notebook/")) {
+      return handleNotebookApi(request, env);
+    }
+
     if (url.pathname.startsWith("/v1/longtail/")) {
       return handleLongtailApi(request, env);
     }
 
     if (url.pathname === "/v1/candidates" || url.pathname.startsWith("/v1/candidates/")) {
       return handleMemoryCandidates(request, env);
+    }
+
+    if (url.pathname.startsWith("/v1/import/")) {
+      return handleImportApi(request, env);
     }
 
     if (

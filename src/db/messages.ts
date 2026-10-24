@@ -4,6 +4,7 @@ import { sha256Hex } from "../utils/hash";
 import { newId } from "../utils/ids";
 import { nowIso } from "../utils/time";
 import { cleanMessageText } from "../utils/sanitize";
+import { getImportedMessagesByIds, IMPORTED_MESSAGE_PREFIX } from "./v2/imports";
 
 export const MESSAGE_ORDER_SQL =
   "created_at ASC, seq ASC, CASE role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 ELSE 2 END ASC, id ASC";
@@ -172,8 +173,14 @@ export async function getMessagesByIds(
     )
     .bind(input.namespace, ...input.ids)
     .all<MessageRecord>();
+  const rows = result.results ?? [];
 
-  return result.results ?? [];
+  // 导入的旧聊天不在 messages 里 (那里 7 天就删)，候选和记忆挂的是 imsg_ 开头的 id，到 imported_messages 找。
+  // 看出处、clef 审、助手用 MCP 看候选都走这里，所以导入的原话处处都查得到。
+  const found = new Set(rows.map((row) => row.id));
+  const importedIds = input.ids.filter((id) => !found.has(id) && id.startsWith(IMPORTED_MESSAGE_PREFIX));
+  if (importedIds.length === 0) return rows;
+  return [...rows, ...(await getImportedMessagesByIds(db, { namespace: input.namespace, ids: importedIds }))];
 }
 
 export async function countMessagesAfterTimestamp(

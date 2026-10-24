@@ -2,10 +2,12 @@ import { authenticate } from "../auth/apiKey";
 import { requireScope } from "../auth/scopes";
 import { getOrCreateConversation } from "../db/conversations";
 import { createMemory, getMemoryById, listMemoriesPage, softDeleteMemory, updateMemory } from "../db/memories";
-import { listMessagesByNamespaceInRange, saveIngestMessages } from "../db/messages";
+import { getMessagesByIds, listMessagesByNamespaceInRange, saveIngestMessages } from "../db/messages";
 import { runDailyMemoryDigest } from "../memory/dailyDigest";
 import { deleteMemoryEmbedding, upsertMemoryEmbedding } from "../memory/embedding";
-import { exportMemories } from "../memory/export";
+import { exportMemories, exportMemoryDocument } from "../memory/export";
+import { readDreamTimeZoneFromEnv } from "../memory/dreamEnv";
+import { loadSpeakersForNamespace } from "../memory/speakers";
 import { filterAndCompressMemoriesWithMeta } from "../memory/filter";
 import { formatMemoryPatch } from "../memory/inject";
 import { findSimilarActiveMemory } from "../memory/dedupGate";
@@ -23,7 +25,10 @@ import {
   updatePrecious,
   fetchMemoryLifecycleRows,
   getDailyLog,
+  getImportCandidateDay,
   getMemoryCandidateById,
+  IMPORT_CANDIDATE_SOURCES,
+  isImportCandidateSource,
   listGlossary,
   listJudgeDecisionsSince,
   listMemoryCandidates,
@@ -37,6 +42,7 @@ import {
   upsertMemoryByFactKey
 } from "../db/v2";
 import { parseJudgeNote, undoJudgeDecision } from "../memory/candidateJudge";
+import { handleMemoryRevisions } from "./transfer";
 import { isClefReviewOn } from "../memory/clefJudge";
 import { withImpressionDisclaimer } from "../memory/impression";
 import { isV2Enabled, runRecall } from "../memory/v2/recall";
@@ -185,10 +191,33 @@ async function handleListMemories(request: Request, env: Env, profile: KeyProfil
 async function handleExportMemories(request: Request, env: Env, profile: KeyProfile): Promise<Response> {
   let scopeError = requireScope(profile, "memory:read");
   if (scopeError) return scopeError;
-  scopeError = requireScope(profile, "export:read");
-  if (scopeError) return scopeError;
 
   const url = new URL(request.url);
+  const format = (readString(url.searchParams.get("format")) || "json").toLowerCase();
+  // md / jsonl 从 D1 读、给人带走用，只要 memory:read：能读记忆的钥匙本来就能一页页把记忆全翻出来，
+  // 再卡 export:read 只会让后台主钥匙导不出自己的记忆。老的 json 导出照旧要 export:read。
+  if (format === "md" || format === "markdown" || format === "jsonl") {
+    const namespace = resolveNamespace(profile, url.searchParams.get("namespace"));
+    const speakers = await loadSpeakersForNamespace(env, namespace);
+    const document = await exportMemoryDocument(env, {
+      namespace,
+      format: format === "jsonl" ? "jsonl" : "md",
+      title: speakers?.assistantName ?? null,
+      timeZone: readDreamTimeZoneFromEnv(env)
+    });
+    return new Response(document.body, {
+      headers: {
+        "content-type": document.contentType,
+        "content-disposition": `attachment; filename="${document.filename}"`,
+        "cache-control": "no-store",
+        "x-aelios-memories": String(document.memories),
+        "x-aelios-precious": String(document.precious)
+      }
+    });
+  }
+
+  scopeError = requireScope(profile, "export:read");
+  if (scopeError) return scopeError;
   try {
     const result = await exportMemories(env, {
       namespace: resolveNamespace(profile, url.searchParams.get("namespace")),
@@ -544,9 +573,15 @@ export async function handleMemoryBoot(request: Request, env: Env): Promise<Resp
       limit: 160
     }),
     countMessagesInRange(env.DB, { namespace, startCreatedAt: start, endCreatedAt: end }),
-    countMemoryCandidates(env.DB, { namespace, status: "pending" }),
+    countMemoryCandidates(env.DB, { namespace, status: "pending", excludeSources: IMPORT_CANDIDATE_SOURCES }),
     countActiveMemoriesByType(env.DB, namespace)
   ]);
+  // 导入的候选单独数：审核页的角标只算日常的，导入的在「导入的」那一栏。
+  const pendingImportCount = await countMemoryCandidates(env.DB, {
+    namespace,
+    status: "pending",
+    onlySources: IMPORT_CANDIDATE_SOURCES
+  });
 
   return json({
     data: {
@@ -558,6 +593,7 @@ export async function handleMemoryBoot(request: Request, env: Env): Promise<Resp
       stats: {
         today_raw_count: todayRawCount,
         pending_candidates: pendingCount,
+        pending_import_candidates: pendingImportCount,
         memory_type_counts: typeCounts
       }
     }
@@ -765,6 +801,8 @@ async function createApprovedMemoryFromCandidate(
     sourceMessageIds: string[];
     source: string;
     excludeIds?: string[];
+    /** 只在新建时用 (导入的候选带着原来的日期)。 */
+    createdAt?: string | null;
   }
 ): Promise<ApprovedMemoryResult> {
   if (input.factKey) {
@@ -777,7 +815,8 @@ async function createApprovedMemoryFromCandidate(
       importance: input.importance,
       tags: input.tags,
       source: input.source,
-      sourceMessageIds: input.sourceMessageIds
+      sourceMessageIds: input.sourceMessageIds,
+      createdAt: input.createdAt
     });
     return { id: result.id, action: "upserted" };
   }
@@ -799,7 +838,8 @@ async function createApprovedMemoryFromCandidate(
       tags: input.tags,
       source: input.source,
       sourceMessageIds: input.sourceMessageIds,
-      reason: "dedup_gate_supersede"
+      reason: "dedup_gate_supersede",
+      createdAt: input.createdAt
     });
     return { id: result.newId, action: "superseded", supersededId: hit.memory.id };
   }
@@ -812,7 +852,8 @@ async function createApprovedMemoryFromCandidate(
     importance: input.importance,
     tags: input.tags,
     source: input.source,
-    sourceMessageIds: input.sourceMessageIds
+    sourceMessageIds: input.sourceMessageIds,
+    createdAt: input.createdAt
   });
   await syncMemoryEmbeddingBestEffort(env, created);
   return { id: created.id, action: "created" };
@@ -831,10 +872,14 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
   if (request.method === "GET" && !id) {
     const scopeError = requireScope(auth.profile, "memory:read");
     if (scopeError) return scopeError;
+    // scope=daily 只要日常整理出来的，scope=import 只要导入的；不带就全要 (老客户端照旧)。
+    const scope = readString(url.searchParams.get("scope"));
     const rows = await listMemoryCandidates(env.DB, {
       namespace,
       status: readString(url.searchParams.get("status")) || "pending",
-      limit: readPositiveInt(url.searchParams.get("limit"), 100, 200)
+      limit: readPositiveInt(url.searchParams.get("limit"), 100, 200),
+      ...(scope === "daily" ? { excludeSources: IMPORT_CANDIDATE_SOURCES } : {}),
+      ...(scope === "import" ? { onlySources: IMPORT_CANDIDATE_SOURCES } : {})
     });
     return json({ data: rows.map(toCandidateApiRecord) });
   }
@@ -851,6 +896,27 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
     });
     // auto_review 告诉审核页 clef 每天自动审开没开 (后台设置里的开关)。
     return json({ data: rows.map(toJudgeDecisionRecord), auto_review: isClefReviewOn(env) ? "clef" : null });
+  }
+
+  // 候选挂的原话：GET /v1/candidates/:id/sources。导入的旧聊天也在这里查得到 (getMessagesByIds 会去 imported_messages 找)。
+  if (request.method === "GET" && id && action === "sources") {
+    const readError = requireScope(auth.profile, "memory:read");
+    if (readError) return readError;
+    const candidate = await getMemoryCandidateById(env.DB, { namespace, id });
+    if (!candidate) return openAiError("Candidate not found", 404);
+    const ids = parseJsonArray(candidate.source_message_ids).slice(0, 90);
+    const messages = await getMessagesByIds(env.DB, { namespace, ids });
+    return json({
+      data: {
+        messages: messages.map((message) => ({
+          id: message.id,
+          role: message.role,
+          created_at: message.created_at,
+          content: message.content
+        })),
+        missing: Math.max(ids.length - messages.length, 0)
+      }
+    });
   }
 
   const scopeError = requireScope(auth.profile, "memory:write");
@@ -902,6 +968,12 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
       });
     }
 
+    // 导入的候选：新记忆的 created_at 用那天的日期 (聊天那天或条目上写的)，updated_at 照旧是现在。
+    const importDay = isImportCandidateSource(candidate.source)
+      ? await getImportCandidateDay(env.DB, { candidateId: candidate.id })
+      : null;
+    const importCreatedAt = importDay && /^\d{4}-\d{2}-\d{2}$/.test(importDay) ? `${importDay}T12:00:00.000Z` : null;
+
     if (candidate.target_memory_id) {
       const target = await getMemoryById(env.DB, { namespace, id: candidate.target_memory_id });
       const targetActive =
@@ -920,7 +992,8 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
           tags,
           source: "review",
           sourceMessageIds,
-          reason: "approve_update"
+          reason: "approve_update",
+          createdAt: importCreatedAt
         });
         const updated = await updateMemoryCandidateStatus(env.DB, {
           namespace,
@@ -944,6 +1017,7 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
       ? `${readString(body.decision_note) || "approved"}; target_gone_fallback`
       : readString(body.decision_note) || "approved";
     const approval = await createApprovedMemoryFromCandidate(env, {
+      createdAt: importCreatedAt,
       namespace,
       type,
       content,
@@ -998,7 +1072,8 @@ export async function handleMemoryCandidates(request: Request, env: Env): Promis
         importance: Math.max(importance, target.importance),
         tags,
         sourceMessageIds
-      }
+      },
+      revision: { by: "review", reason: "candidate_merge" }
     });
     if (updatedTarget) await syncMemoryEmbeddingBestEffort(env, updatedTarget);
     const updated = await updateMemoryCandidateStatus(env.DB, {
@@ -1084,7 +1159,12 @@ async function handlePatchMemory(
     expiresAt: body.expires_at === undefined ? undefined : readOptionalString(body.expires_at)
   };
 
-  const updated = await updateMemory(env.DB, { namespace, id, patch });
+  const updated = await updateMemory(env.DB, {
+    namespace,
+    id,
+    patch,
+    revision: { by: patch.source || profile.source, reason: "edit" }
+  });
   if (updated) {
     if (updated.status === "active") {
       await syncMemoryEmbeddingBestEffort(env, updated);
@@ -1164,6 +1244,10 @@ export async function handleMemories(request: Request, env: Env, ctx: ExecutionC
 
   if (tail.length === 1 && tail[0] === "export" && request.method === "GET") {
     return handleExportMemories(request, env, auth.profile);
+  }
+
+  if (tail.length === 2 && tail[1] === "revisions" && request.method === "GET") {
+    return handleMemoryRevisions(request, env, auth.profile, tail[0]);
   }
 
   if (tail.length === 1) {

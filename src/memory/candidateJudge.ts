@@ -9,6 +9,7 @@ import { getMessagesByIds } from "../db/messages";
 import {
   archiveMemory,
   checkMemoryRestorable,
+  IMPORT_CANDIDATE_SOURCES,
   getActiveMemoryByFactKey,
   listMemoryCandidates,
   restoreMemory,
@@ -196,7 +197,13 @@ export async function runCandidateJudge(
   const judgedBy = CLEF_JUDGE_NAME;
   const limit = readPositiveInt(options.limit ?? env.JUDGE_MAX_CANDIDATES, CLEF_DEFAULT_MAX_CANDIDATES, MAX_CANDIDATES_CAP);
 
-  const candidates = await listMemoryCandidates(env.DB, { namespace, status: "pending", limit });
+  // 导入的候选等本人在审核页点，自动审不碰 (也找不到 messages 里的原文，会被一律判没依据)。
+  const candidates = await listMemoryCandidates(env.DB, {
+    namespace,
+    status: "pending",
+    limit,
+    excludeSources: IMPORT_CANDIDATE_SOURCES
+  });
   if (candidates.length === 0) {
     return { ran: true, judged: 0, approved: 0, discarded: 0, kept: 0, failed: 0, model, judgedBy, reason: "no_candidates" };
   }

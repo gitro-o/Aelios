@@ -13,11 +13,23 @@ import type { ExtractedMemory } from "./extract";
 const DEFAULT_DREAM_EXTRACT_MAX_TOKENS = 1200;
 const DEFAULT_WORKERS_AI_DREAM_MODEL = "workers-ai/@cf/openai/gpt-oss-120b";
 
-interface DreamExtractModelResult {
+export interface DreamExtractModelResult {
   memories: ExtractedMemory[];
   model?: string;
   reason?: "missing_model" | "model_error" | "model_invalid_json";
   status?: number;
+  /** 模型回的用量 (有就带上)。导入聊天记录要按段显示花了多少 token。 */
+  usage?: { input: number; output: number };
+  /** 模型回的 finish_reason；"length" 说明输出被截断了，可以把这段切小再来。 */
+  finishReason?: string | null;
+}
+
+function readUsage(usage: OpenAIChatResponse["usage"]): { input: number; output: number } | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const input = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
+  const output = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
+  if (!input && !output) return undefined;
+  return { input, output };
 }
 
 function readPositiveInt(value: unknown, fallback: number, max: number): number {
@@ -210,12 +222,15 @@ async function callDreamExtractModel(
     const response = await callOpenAICompat(env, request);
     if (!response.ok) return { memories: [], model, reason: "model_error", status: response.status };
     const parsed = (await response.json()) as OpenAIChatResponse;
+    const usage = readUsage(parsed.usage);
+    const choice = parsed.choices?.[0] as { finish_reason?: unknown } | undefined;
+    const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : null;
     const message = parsed.choices?.[0]?.message as ({ content?: unknown; reasoning_content?: unknown }) | undefined;
     const content = typeof message?.content === "string" ? message.content.trim() : "";
     const reasoning = typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
     const memories = parseExtractModelOutput(content || reasoning);
-    if (!memories) return { memories: [], model, reason: "model_invalid_json" };
-    return { memories, model };
+    if (!memories) return { memories: [], model, reason: "model_invalid_json", usage, finishReason };
+    return { memories, model, usage, finishReason };
   } catch (error) {
     console.error("dream extract: model failed", { model, error });
     return { memories: [], model, reason: "model_error" };
@@ -239,12 +254,26 @@ async function loadDiaryBackground(env: Env, namespace: string, dateLabel: strin
 
 export async function extractDreamMemoriesFromMessages(
   env: Env,
-  input: { namespace: string; messages: MessageRecord[]; speakers?: DreamSpeakers | null; dateLabel?: string }
+  input: {
+    namespace: string;
+    messages: MessageRecord[];
+    speakers?: DreamSpeakers | null;
+    dateLabel?: string;
+    /** 库里还没有、但同一批里已经用过的 fact_key (导入聊天记录时前几天抽出来还在待审的)，一起交给模型复用。 */
+    extraFactKeys?: string[];
+    /** false 就不拿前几天的日记当背景 (导入的旧聊天跟现在的日记对不上)。 */
+    diaryBackground?: boolean;
+  }
 ): Promise<DreamExtractModelResult> {
-  const [existingFactKeys, background] = await Promise.all([
+  const [activeFactKeys, background] = await Promise.all([
     listActiveFactKeys(env.DB, { namespace: input.namespace }),
-    input.dateLabel ? loadDiaryBackground(env, input.namespace, input.dateLabel) : Promise.resolve([])
+    input.dateLabel && input.diaryBackground !== false
+      ? loadDiaryBackground(env, input.namespace, input.dateLabel)
+      : Promise.resolve([])
   ]);
+  const existingFactKeys = input.extraFactKeys?.length
+    ? [...new Set([...activeFactKeys, ...input.extraFactKeys])]
+    : activeFactKeys;
   const speakers = input.speakers !== undefined
     ? input.speakers
     : speakersForNamespace(await loadConfig(env), input.namespace);

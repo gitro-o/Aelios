@@ -1,6 +1,11 @@
 import { authenticate } from "../auth/apiKey";
 import { listDreamRunsForNamespace } from "../db/dreamRuns";
-import { listJudgedCandidatesInRange, listMemoriesCreatedInRange, listMemoriesGoneDormantInRange } from "../db/v2";
+import {
+  IMPORT_CANDIDATE_SOURCES,
+  listJudgedCandidatesInRange,
+  listMemoriesCreatedInRange,
+  listMemoriesGoneDormantInRange
+} from "../db/v2";
 import { runCandidateJudge } from "../memory/candidateJudge";
 import {
   countRawMessagesForDateLabel,
@@ -160,7 +165,7 @@ export async function handleDreamHarvest(request: Request, env: Env): Promise<Re
     const [created, dormant, candidates] = await Promise.all([
       listMemoriesCreatedInRange(env.DB, { namespace, startIso, endIso }),
       listMemoriesGoneDormantInRange(env.DB, { namespace, startIso, endIso }),
-      listJudgedCandidatesInRange(env.DB, { namespace, startIso, endIso })
+      listJudgedCandidatesInRange(env.DB, { namespace, startIso, endIso, excludeSources: IMPORT_CANDIDATE_SOURCES })
     ]);
 
     return json({

@@ -6,13 +6,13 @@ import { timingSafeEqual } from "node:crypto";
 import worker from "../src/index";
 import { invalidateSettingsCache } from "../src/gateway/config";
 
-// MCP tool list as the Claude app sees it: nine everyday tools named after the moment they are for,
+// MCP tool list as the Claude app sees it: ten everyday tools named after the moment they are for,
 // usage guidance both in initialize and in wake_up (the Claude app ignores instructions), old names still callable.
 (crypto.subtle as any).timingSafeEqual = (a: Uint8Array, b: Uint8Array) => timingSafeEqual(a, b);
 let sqlite: DatabaseSync;
 let env: any;
 
-const CORE = ["wake_up", "recall", "remember", "keep_moment", "forget", "learn_word", "read_diary", "log_conversation", "list_memories"];
+const CORE = ["wake_up", "recall", "remember", "keep_moment", "forget", "learn_word", "read_diary", "log_conversation", "list_memories", "notebook"];
 
 beforeEach(() => {
   sqlite?.close(); sqlite = new DatabaseSync(":memory:");
@@ -64,9 +64,10 @@ test("initialize carries the usage guidance for clients that read instructions",
   assert.match(result.instructions, /wake_up/);
   assert.match(result.instructions, /recall/);
   assert.match(result.instructions, /log_conversation/);
+  assert.match(result.instructions, /notebook/);
 });
 
-test("the default list is the nine everyday tools; review shows only with clef off, maintenance only with tools=all", async () => {
+test("the default list is the ten everyday tools; review shows only with clef off, maintenance only with tools=all", async () => {
   assert.deepEqual(await listNames(), CORE);
   env.CLEF_AUTO_REVIEW = "off";
   assert.deepEqual(await listNames(), [...CORE, "memory_candidates", "memory_review"]);
@@ -114,6 +115,24 @@ test("remember saves without a fact_key and replaces with history, never in plac
   assert.equal(row("memories", "m-coffee").content, "她早上喝拿铁。");
   assert.equal(row("memories", "m-coffee").version_status, "superseded");
   assert.equal(row("memories", keyed.id).fact_key, "user:coffee");
+});
+
+test("remember keeps world_fact as world knowledge; other free-form types still become one of the eight", async () => {
+  const world = (await call("remember", { content: "抹茶是碾茶磨成的粉。", type: "world_fact", fact_key: "world:matcha" })).structuredContent.data;
+  assert.equal(row("memories", world.id).type, "world_fact");
+  // Looked up again under the same key: the new version replaces it and is still world knowledge.
+  const again = (await call("remember", { content: "抹茶是用碾茶磨成的粉，产自日本。", fact_key: "world:matcha" })).structuredContent.data;
+  assert.equal(again.replaced, world.id);
+  assert.equal(row("memories", again.id).type, "world_fact");
+  // The old upsert rewrites in place and always carries a type (fact by default); a world fact stays one.
+  const upserted = (await call("memory_upsert", { fact_key: "world:matcha", content: "抹茶是碾茶磨成的粉。" })).structuredContent.data;
+  assert.equal(upserted.id, again.id);
+  assert.equal(row("memories", again.id).type, "world_fact");
+  // A replacement that names a type of the eight takes it.
+  const moved = (await call("remember", { content: "她喜欢抹茶。", replaces: again.id, type: "preference" })).structuredContent.data;
+  assert.equal(row("memories", moved.id).type, "preference");
+  const free = (await call("remember", { content: "一个项目。", type: "project" })).structuredContent.data;
+  assert.equal(row("memories", free.id).type, "fact");
 });
 
 test("forget archives by default and erases only when asked", async () => {

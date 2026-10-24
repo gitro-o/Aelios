@@ -131,11 +131,29 @@ export function buildClefInput(
 }
 
 /** 一条候选一次调用。Worker 的 AI 绑定直接回 {answers}；REST 外壳 {result:{answers}} 也认。 */
-export async function askClef(env: Env, input: ReturnType<typeof buildClefInput>, kind: JudgeKind): Promise<JudgeModelResult | null> {
+async function runClef(env: Env, input: ReturnType<typeof buildClefInput>): Promise<unknown> {
   if (!env.AI) throw new Error("clef needs the Workers AI binding");
   type RunArgs = Parameters<Ai["run"]>;
   const raw = (await env.AI.run(CLEF_MODEL as RunArgs[0], input as unknown as RunArgs[1])) as unknown;
   const body = raw && typeof raw === "object" && "result" in raw ? (raw as { result: unknown }).result : raw;
-  const answers = body && typeof body === "object" ? (body as { answers?: unknown }).answers : undefined;
-  return clefVerdict(kind, answers);
+  return body && typeof body === "object" ? (body as { answers?: unknown }).answers : undefined;
+}
+
+export async function askClef(env: Env, input: ReturnType<typeof buildClefInput>, kind: JudgeKind): Promise<JudgeModelResult | null> {
+  return clefVerdict(kind, await runClef(env, input));
+}
+
+/**
+ * 新增提案两个问题的原始概率，不下结论。导入聊天记录时用：clef 只给意见，记不记由人在审核页定，
+ * 页面上按「有依据 / 值得记」两个数筛。
+ */
+export async function askClefAddScores(
+  env: Env,
+  input: ReturnType<typeof buildClefInput>
+): Promise<{ grounded: number; worth: number } | null> {
+  const answers = await runClef(env, input);
+  const grounded = readNoul(answers, "grounded");
+  const worth = readNoul(answers, "worth");
+  if (grounded === null || worth === null) return null;
+  return { grounded, worth };
 }

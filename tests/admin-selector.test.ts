@@ -56,6 +56,44 @@ test('legacy and explicitly chosen custom spaces are preserved', async () => {
   }
 });
 
+test('with no assistants configured, a stale space can be picked back to the one holding the memories', async () => {
+  const { app, storage } = panel({ 'aelios.admin.namespace': 'Claude' });
+  app.request = async (path: string) => {
+    if (path === '/api/gateway/config') return { identities: [] };
+    if (path === '/api/gateway/spaces') return { spaces: [{ namespace: 'default', memories: 312 }, { namespace: 'notes', memories: 4 }] };
+    return { data: [] };
+  };
+  await app.init();
+  // The stored choice is kept, but the picker offers default and every space with memories.
+  assert.equal(app.selectedIdentity, '');
+  assert.equal(app.namespace, 'Claude');
+  assert.equal(JSON.stringify(app.pickerSpaces().map((s: any) => s.label)), '["default · 312 条","notes · 4 条","Claude · 没有记忆"]');
+  assert.equal(app.emptySpaceHint().text, '「Claude」里还没有记忆，default 里有 312 条。');
+  assert.match(ADMIN_HTML, /x-for="space in pickerSpaces\(\)"/);
+  await app.pickSpace(app.emptySpaceHint().space);
+  assert.equal(app.namespace, 'default');
+  assert.equal(app.emptySpaceHint(), null);
+  assert.equal(storage.get('aelios.admin.namespace'), 'default');
+  assert.equal(storage.get('aelios.admin.identity'), '');
+});
+
+test('an assistant keeps its own spaces in the picker; other spaces go through custom mode', async () => {
+  const { app } = panel();
+  const base = app.request;
+  app.request = async (path: string, options?: any) => path === '/api/gateway/spaces'
+    ? { spaces: [{ namespace: 'default', memories: 312 }] } : base(path, options);
+  await app.init();
+  assert.equal(JSON.stringify(app.pickerSpaces().map((s: any) => s.name)), '["danjiu","shared"]');
+  // An assistant's own empty space is the settings page's hint to raise, not a reason to drop the assistant here.
+  assert.equal(app.emptySpaceHint(), null);
+  await app.pickSpace('shared');
+  assert.equal(app.selectedIdentity, 'danjiu');
+  assert.equal(app.namespace, 'shared');
+  await app.pickSpace('default');
+  assert.equal(app.selectedIdentity, '');
+  assert.equal(app.namespace, 'default');
+});
+
 test('switching spaces clears selections and reloads the visible diary', async () => {
   const { app } = panel();
   app.page = 'diary'; app.diaryDailies = [{ title: 'old diary' }];

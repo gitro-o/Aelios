@@ -12,6 +12,20 @@ Aelios is a memory gateway that runs on Cloudflare. Your Chatbox / Claude Code /
 your client  →  Aelios (identify, remember, recall)  →  the model
 ```
 
+## Let an AI set it up
+
+With an AI that can run commands (Claude Code, Codex and the like), send it this:
+
+```text
+Install and set up Aelios (my AI memory gateway) for me. Read https://raw.githubusercontent.com/wusaki0723/Aelios/main/docs/setup-with-ai.md first and follow it. When I need to click something in the browser or enter a key myself, stop and tell me where.
+```
+
+It works from scratch: it forks and deploys Aelios, creates the Cloudflare token, configures the assistant and imports your old memories. At the end it hands you a base URL, an API key and the model name to pick, ready for your chat app. You need a Cloudflare account (the free plan is enough) and a key for your model. All you do yourself is click "Allow" in the browser (twice for a new install) and store the model key in the Cloudflare dashboard (it tells you where). The guide is written in Chinese; the AI will talk to you in your language.
+
+The recommended setup is **API mode plus the MCP connector**: chats go through Aelios, so every turn is remembered and recalled automatically, and with MCP the assistant can also look things up and save them on its own. Only if you have a Claude subscription and no API access, use MCP alone.
+
+To do it by hand, follow the three steps below.
+
 ## Quick start — three steps
 
 ### 1. Deploy
@@ -106,12 +120,20 @@ Open `/admin`. The bottom tabs:
 | Tab | What it's for |
 |---|---|
 | **Today** | What you talked about today |
-| **Review queue** | Candidate memories consolidated overnight. Cloudflare's clef reviews them every night by default; the week's decisions are listed here with an undo. With clef switched off they wait here, or the assistant reviews them itself over MCP |
-| **Important memories** | Browse, search, edit, delete |
-| **More** | Precious originals, glossary, maintenance tools |
+| **Review queue** | Candidate memories consolidated overnight. Cloudflare's clef reviews them every night by default; the week's decisions are listed here with an undo. With clef switched off they wait here, or the assistant reviews them itself over MCP. Anything imported from elsewhere sits in its own "Imported" tab and waits for you alone |
+| **Important memories** | Browse, search, edit, delete; a memory rewritten in place keeps its earlier versions under "Old versions", where you can restore one |
+| **More** | Precious originals, glossary, notebook, import / export, maintenance tools |
 | **Settings** | Upstream, assistants, environment parameters |
 
 Want the AI to remember, forget, or fix something? It's all point-and-click.
+
+### Moving memories: export and import
+
+Under "More → Import / export", each one works on the space you have selected:
+
+- **Export**: md or jsonl. The md has one memory per line (date, text, #tags, the key in backticks); open it, edit it, and import it back as is. A line with the same key rewrites that memory, and the old version is kept.
+- **Import tidied entries**: one per line, `- 2025-12-15 [preference] text #tag`; date, type and tags are optional, and a plain md list or paragraphs work too. The page has a ready prompt to paste into the AI you used before so it lists what it remembers in this format. Entries can go straight in (exact duplicates are skipped, near-duplicates go to review) or all go to review first.
+- **Import a chat history**: ChatGPT and Claude `conversations.json`, SillyTavern `.jsonl`, and plain "Name: text" transcripts. The file is read in the page and cut by day; each day goes through the same model the nightly consolidation uses (`DREAM_MODEL`), and what it finds only lands in the review page's "Imported" tab, where nothing counts until you approve it. Progress and token use are shown as it runs. Only the lines a candidate quotes are kept, outside the chat table, so the 7-day cleanup never removes them and the nightly run never re-reads them. Close the page and pick the same file later to carry on.
 
 ## How it actually works
 
@@ -129,7 +151,7 @@ One assistant can write to one space and read from several. A fresh conversation
 2. Add the `CLOUDFLARE_API_TOKEN` Worker secret.
 3. In `/admin` Settings, put your 32-character account ID as the upstream and add assistants.
 
-Skip all of that and memory recall + the overnight Dream still work (via Workers AI).
+Skip all of that and memory recall + the overnight Dream still work (via Workers AI). An AI can do these three steps for you: see [Let an AI set it up](#let-an-ai-set-it-up).
 
 **MCP memory for the Claude app (web and mobile), Claude Code and Codex**:
 
@@ -145,11 +167,13 @@ You have the Aelios memory connector: it is your long-term memory of me. In ever
 ```
 
 - Conversations in the Claude app do not pass through Aelios, so the nightly diary and candidates only see what the assistant hands over with `log_conversation`. Clients that go through the gateway don't need it.
-- Only the nine everyday tools are listed by default. For maintenance tools such as `memory_get` and `memory_export`, add `&tools=all` to the address.
+- Only the ten everyday tools are listed by default. For maintenance tools such as `memory_get` and `memory_export`, add `&tools=all` to the address.
 
-For automatic per-message recall and batch write-back in Claude Code, use the Hook in this repo: [`integrations/claude-code/`](integrations/claude-code/README.md).
+If you only have a Claude subscription and cannot use API mode, get automatic per-message recall and batch write-back in Claude Code with the Hook in this repo: [`integrations/claude-code/`](integrations/claude-code/README.md).
 
 **Seeing images (guide-dog)**: add the `GUIDE_DOG_API_KEY` secret, then point your client at `https://<Worker address>/v1/guide-dog` with model `companion`. The guide-dog only describes images — it writes no memory.
+
+**A companion that lives on Cloudflare: [Aelios-resident](https://github.com/wusaki0723/Aelios-resident)** — a separate Worker (one Durable Object, built on Cloudflare's Think) that you talk to on Telegram and on its own web page, both one conversation. With Aelios connected, its chat goes through your assistant's `/v1` endpoint like any other client, so Aelios does the recalling and the remembering; it also uses the memory tools, and what lasts from its web searches is saved as world knowledge. On top of that it writes itself a handoff letter when you go quiet, checks in on a schedule, searches and reads the web, connects other MCP servers, and lets you change the model, persona and settings on its web page. It runs on the Workers Free plan. To connect it, fill in this Aelios's address, a key and the assistant to chat as on its settings page (the model you pick has to be one of that assistant's primary models); deployment is in its README.
 
 ## Common pitfalls
 
@@ -204,13 +228,19 @@ Configuration has three layers, all under `/admin` Settings: upstream, assistant
 | GET | `/v1/memory_boot` | Cold-start pack |
 | GET | `/v1/diary`, `/v1/diary/recent` | Diary |
 | GET / POST / DELETE | `/v1/precious`, `/v1/glossary` | Precious originals / glossary |
-| GET / POST | `/v1/candidates` | Review queue; `/decisions?days=7` lists automatic decisions, `/:id/undo` reverses one |
+| GET / POST / PATCH / DELETE | `/v1/notebook` | Notebook pages; `/:id` opens, edits or deletes one, `DELETE ?confirm=all` clears the space's notebook |
+| GET / POST | `/v1/candidates` | Review queue; `?scope=daily` for the nightly ones only, `/decisions?days=7` lists automatic decisions, `/:id/undo` reverses one, `/:id/sources` shows the quoted lines |
+| GET | `/v1/memories/export?format=md\|jsonl` | Export the space's memories and precious lines (`memory:read` is enough) |
+| GET | `/v1/memories/:id/revisions` | Earlier versions of a memory rewritten in place |
+| GET / POST | `/v1/import/*` | Import: `info`, `entries/preview`, `entries`, `batches`, `chat/chunk`, `candidates` |
 
 Everything except `/health` and `/admin` requires `Authorization: Bearer <key>`. The gateway authorizes by assistant key; memory APIs by `memory:read` / `memory:write` scopes.
 
 ### MCP tools
 
-`wake_up` `recall` `remember` `keep_moment` `forget` `learn_word` `read_diary` `log_conversation` `list_memories`
+`wake_up` `recall` `remember` `keep_moment` `forget` `learn_word` `read_diary` `log_conversation` `list_memories` `notebook`
+
+`notebook` keeps named pages the assistants read and rewrite themselves, such as progress on a long task. Pages are never recalled automatically, changed overnight or expired; you can edit, delete or clear them under "More → Notebook".
 
 With the clef review switched off, `memory_candidates` and `memory_review` are listed too; `&tools=all` on the address adds `memory_get` and `memory_export`. The old names (`memory_boot`, `memory_recall`, `memory_search`, `memory_upsert`, `memory_supersede`, `memory_archive`, `memory_delete`, `memory_ingest`, `memory_pin`, `glossary_set`, `diary_get`, `memory_list`) are no longer listed but still work when called.
 
@@ -239,7 +269,7 @@ AGPL-3.0
 
 Free to use and modify; if you run a modified version as a network service, you must open-source your modifications under the same license.
 
-The final v1 point is tag `v1-final` (MIT at the time). `tg-bot` is the Telegram integration branch, stuck at 2026-07-16 as of 2026-09-11 with main 154 commits ahead (135 files, ~18k lines changed) while the branch itself only added 17 files — it can't be merged back as-is. Kept as history; resurrect it by rebasing onto main, never by direct merge.
+The final v1 point is tag `v1-final` (MIT at the time).
 
 ## Community
 

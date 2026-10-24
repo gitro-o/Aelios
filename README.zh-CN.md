@@ -6,6 +6,20 @@
 
 它是一个跑在 Cloudflare 上的记忆网关：你的 Chatbox / Claude Code / Codex 先连它，它再把请求转给模型。对话会被记下来，下次自动想起来。
 
+## 让 AI 帮你配
+
+用 Claude Code、Codex 这类能跑命令的 AI，把这段话发给它：
+
+```text
+帮我装好、配好 Aelios（我的 AI 记忆网关）。先读 https://raw.githubusercontent.com/wusaki0723/Aelios/main/docs/setup-with-ai.md ，照着做。需要我在浏览器里点、或者需要我自己填 key 的时候，停下来告诉我去哪儿填。
+```
+
+从零开始也行：它会帮你 fork、部署、生成 Cloudflare 令牌、配好助手、导入以前的记忆，最后交给你一个地址、一把 API Key 和要选的模型名，填进聊天软件就能用。你要准备一个 Cloudflare 账号（免费）和一个模型的 key；自己动手的只有在浏览器里点「允许」（新装两次），和把模型的 key 存进 Cloudflare 后台（它会告诉你去哪儿填）。
+
+推荐 **API 模式加 MCP 连接器**：聊天经过 Aelios，每句话自动记、自动想起来；再接上 MCP，助手还能主动查、主动记。只有 Claude 订阅、没有 API 的，才只用 MCP。
+
+想自己动手，看下面的三步。
+
 ## 怎么用
 
 就三步。
@@ -102,12 +116,20 @@ GitHub 不会自己更新 Fork。有新版本时：
 | 标签 | 干什么 |
 |---|---|
 | **今日** | 今天聊了什么 |
-| **审核队列** | 夜间整理出来的候选记忆。默认每晚由 Cloudflare 的 clef 审完，这周定下的都列在这里，不对就撤回。设置里关掉 clef 后候选留在这里等你批，也可以让助手用 MCP 自己审 |
-| **重要记忆** | 浏览、搜索、改、删 |
-| **更多** | 珍贵原文、术语表、维护工具 |
+| **审核队列** | 夜间整理出来的候选记忆。默认每晚由 Cloudflare 的 clef 审完，这周定下的都列在这里，不对就撤回。设置里关掉 clef 后候选留在这里等你批，也可以让助手用 MCP 自己审。从别处导进来的单独放在「导入的」一栏，只等你自己点 |
+| **重要记忆** | 浏览、搜索、改、删；被原地改写过的记忆点「旧版」能看到改之前的样子，也能恢复 |
+| **更多** | 珍贵原文、术语表、小本本、导入导出、维护工具 |
 | **设置** | 上游、助手、环境参数 |
 
 想让 AI 记住、忘掉、改掉什么，在面板点就行。
+
+### 搬记忆：导出、导入
+
+在「更多 → 导入导出」，每样都按当前选的空间来：
+
+- **导出**：md 或 jsonl。md 一行一条（日期、正文、#标签、反引号里的 key），能直接打开改，改完原样导回来：key 一样的会改写原来那条，旧版留着。
+- **导入整理好的条目**：一行一条，`- 2025-12-15 [偏好] 内容 #标签`，日期、类型、标签都可以省；普通的 md 列表、一段段文字也认。页面上有一段提示词，贴给原来用的 AI，它就按这个格式把记得的事列出来。可以直接写进库（一字不差的跳过，跟库里很像的转去审核），也可以全部先进审核。
+- **导入聊天记录**：认 ChatGPT、Claude 导出的 `conversations.json`、酒馆的 `.jsonl`、「名字：内容」一行一句的文本。文件在页面里拆开、按天切段，一段段交给夜里整理记忆用的那个模型（`DREAM_MODEL`）读，抽出来的只进审核页「导入的」，点了才算数；页面上看得到进度和花了多少 token。原话只存被候选引用的那几句，不进聊天记录表，不受 7 天清理影响，也不会被夜里再整理一遍。页面关了下次选同一个文件接着做。
 
 ## 它实际在做什么
 
@@ -129,7 +151,7 @@ GitHub 不会自己更新 Fork。有新版本时：
 2. Worker Secrets 加 `CLOUDFLARE_API_TOKEN`。
 3. `/admin` 设置里，上游填 32 位账号 ID，再加助手。
 
-不配这些，记忆召回和夜间整理也能跑（走 Workers AI）。
+不配这些，记忆召回和夜间整理也能跑（走 Workers AI）。这三步可以交给 AI 做，见[让 AI 帮你配](#让-ai-帮你配)。
 
 **在 Claude 官方 App（网页、手机）、Claude Code、Codex 里用 MCP 记忆**
 
@@ -145,9 +167,9 @@ https://<Worker 地址>/mcp?token=<CHATBOX_API_KEY>
 ```
 
 - 官方 App 的对话不经过 Aelios，夜里的日记和候选靠助手调 `log_conversation` 交过来；走网关的客户端不用调。
-- 默认只列 9 个常用工具；要 `memory_get`、`memory_export` 这类维护工具，地址后面加 `&tools=all`。
+- 默认只列 10 个常用工具；要 `memory_get`、`memory_export` 这类维护工具，地址后面加 `&tools=all`。
 
-想让 Claude Code 每条消息自动召回、批量写回，用仓库里的 Hook：[`integrations/claude-code/`](./integrations/claude-code/README.md)。
+只有 Claude 订阅、走不了 API 时，想让 Claude Code 每条消息自动召回、批量写回，用仓库里的 Hook：[`integrations/claude-code/`](./integrations/claude-code/README.md)。
 
 **看图**
 
@@ -157,6 +179,10 @@ https://<Worker 地址>/mcp?token=<CHATBOX_API_KEY>
 - 模型：`companion`
 
 导盲犬只转述图片，不写记忆。
+
+**住在 Cloudflare 里的伴侣：[Aelios-resident](https://github.com/wusaki0723/Aelios-resident)**
+
+另一个 Worker（一个 Durable Object，基于 Cloudflare 的 Think），在 Telegram 和它自己的网页上跟你聊，两边是同一段对话。接上 Aelios 后，它的聊天跟别的客户端一样从你助手的 `/v1` 过，想起旧事、记下来都由 Aelios 做；它还会用记忆工具，搜网搜到的长期知识存进世界知识。另外：你停下来一阵，它给之后的自己写交接信；到点主动找你；搜网、读网页；接别的 MCP；模型、人设和设置都在它的网页上改。Workers 免费档就能跑。接法是在它的设置页填这个 Aelios 的地址、key 和用哪个助手聊（选的模型要在那个助手的主模型里），部署看它的 README。
 
 ## 最容易踩的坑
 
@@ -211,13 +237,19 @@ CF 上游：chat 走 compat（全厂商，BYOK）；messages / responses 走各�
 | GET | `/v1/memory_boot` | 冷启动包 |
 | GET | `/v1/diary` `/v1/diary/recent` | 日记 |
 | GET / POST / DELETE | `/v1/precious` `/v1/glossary` | 珍贵原文 / 术语表 |
-| GET / POST | `/v1/candidates` | 审核队列；`/decisions?days=7` 自动决定清单，`/:id/undo` 撤回 |
+| GET / POST / PATCH / DELETE | `/v1/notebook` | 小本本；`/:id` 打开、改、删一页，`DELETE ?confirm=all` 清空当前空间的小本本 |
+| GET / POST | `/v1/candidates` | 审核队列；`?scope=daily` 只要日常整理的，`/decisions?days=7` 自动决定清单，`/:id/undo` 撤回，`/:id/sources` 挂的原话 |
+| GET | `/v1/memories/export?format=md\|jsonl` | 导出当前空间的记忆和珍贵（`memory:read` 就够） |
+| GET | `/v1/memories/:id/revisions` | 这条记忆原地改写前的旧版 |
+| GET / POST | `/v1/import/*` | 导入：`info`、`entries/preview`、`entries`、`batches`、`chat/chunk`、`candidates` |
 
 非 `/health` `/admin` 都要 `Authorization: Bearer <key>`。网关按助手钥匙鉴权，记忆接口按 `memory:read` / `memory:write`。
 
 ### MCP 工具
 
-`wake_up` `recall` `remember` `keep_moment` `forget` `learn_word` `read_diary` `log_conversation` `list_memories`
+`wake_up` `recall` `remember` `keep_moment` `forget` `learn_word` `read_diary` `log_conversation` `list_memories` `notebook`
+
+`notebook` 是小本本：助手按页名自己读、自己改的笔记，比如备考进度。不会被自动召回，夜里不会被改写，也不会过期；在「更多 → 小本本」能看、能改、能删、能整本清空。
 
 clef 自动审关着时多列 `memory_candidates` `memory_review`；地址加 `&tools=all` 再多列 `memory_get` `memory_export`。旧名字（`memory_boot`、`memory_recall`、`memory_search`、`memory_upsert`、`memory_supersede`、`memory_archive`、`memory_delete`、`memory_ingest`、`memory_pin`、`glossary_set`、`diary_get`、`memory_list`）不再列出，按旧名调用照样能用。
 
@@ -246,7 +278,7 @@ AGPL-3.0
 
 可自由使用、修改；若把修改后的版本对外提供网络服务，须以相同许可开源修改后的源码。
 
-v1 最终封存点在 tag `v1-final`（当时仍是 MIT）。`tg-bot` 是 Telegram 集成分支，截至 2026-09-11 停在 2026-07-16，之后 main 领先它 154 个 commit（135 个文件、约 1.8 万行改动），分支自己只加了 17 个文件，按现状合不回去。留着当历史看；要捡回来得先 rebase 到 main，别直接合。
+v1 最终封存点在 tag `v1-final`（当时仍是 MIT）。
 
 ## 交流
 

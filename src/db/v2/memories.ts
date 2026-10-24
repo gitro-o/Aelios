@@ -1,6 +1,6 @@
 import { upsertMemoryEmbedding } from "../../memory/embedding";
 import { deleteFtsRow, upsertMemoryFts } from "../../memory/fts";
-import { clampMemoryType } from "../../memory/canonicalTypes";
+import { storedMemoryType, WORLD_FACT_TYPE } from "../../memory/canonicalTypes";
 import type {
   Env,
   MemoryLifecycleRow,
@@ -11,6 +11,7 @@ import type {
 import { newId } from "../../utils/ids";
 import { nowIso } from "../../utils/time";
 import { insertMemoryRelation } from "./relations";
+import { saveMemoryRevision } from "./revisions";
 import { SQLITE_BIND_BATCH_SIZE, uniqueStrings } from "./shared";
 
 // 读取一条完整 MemoryRecord 用于向量同步。v2 写完 D1 后用它拿全字段。
@@ -61,6 +62,7 @@ export async function countActiveMemoriesOfType(
 
 // 抽取器判重用：库里已有的 fact_key 列表，防止同一件事被重复造 key。
 // fact_key 存在 memory_lifecycle 侧车表，不在 memories 本体 (见文件头注释)，所以要 join。
+// 导入时没带 key 的条目用内容哈希当 key (import:类型:哈希)，对模型没意义，还会按字母序挤掉真 key，不给。
 export async function listActiveFactKeys(
   db: D1Database,
   input: { namespace: string; limit?: number }
@@ -75,6 +77,7 @@ export async function listActiveFactKeys(
          AND (m.version_status IS NULL OR m.version_status != 'superseded')
          AND COALESCE(m.fact_key, lc.fact_key) IS NOT NULL
          AND COALESCE(m.fact_key, lc.fact_key) != ''
+         AND COALESCE(m.fact_key, lc.fact_key) NOT LIKE 'import:%'
        ORDER BY fact_key
        LIMIT ?`
     )
@@ -165,7 +168,26 @@ export async function fetchMemoryLifecycleRows(
 // 同时写 D1 (本体) 和 Vectorize (检索镜像)，设 vector_id，否则 recall 召不到。
 export async function upsertMemoryByFactKey(
   env: Env,
-  input: { namespace: string; factKey: string; content: string; summary?: string | null; type?: string; importance?: number; confidence?: number; tags?: string[]; source?: string | null; sourceMessageIds?: string[]; validAsOf?: string | null; authoredBy?: string | null; responseTendency?: string | null }
+  input: {
+    namespace: string;
+    factKey: string;
+    content: string;
+    summary?: string | null;
+    type?: string;
+    importance?: number;
+    confidence?: number;
+    tags?: string[];
+    source?: string | null;
+    sourceMessageIds?: string[];
+    validAsOf?: string | null;
+    authoredBy?: string | null;
+    responseTendency?: string | null;
+    // 只在新建时用：导入的条目带着原来的日期和置顶。改写已有条目时不动这两样。
+    createdAt?: string | null;
+    pinned?: boolean;
+    /** type=world_fact 时存成世界知识，不收进 8 类 (storedMemoryType)。 */
+    allowWorldFact?: boolean;
+  }
 ): Promise<{ id: string; created: boolean }> {
   const db = env.DB;
   const now = nowIso();
@@ -176,7 +198,7 @@ export async function upsertMemoryByFactKey(
   // version_status=superseded 不参与 upsert 命中（LMC-5）。
   const existing = await db
     .prepare(
-      `SELECT m.id, m.authored_by, m.response_tendency FROM memories m
+      `SELECT m.id, m.type, m.authored_by, m.response_tendency FROM memories m
        LEFT JOIN memory_lifecycle lc ON lc.memory_id = m.id
        WHERE m.namespace = ? AND m.status = 'active'
          AND (m.version_status IS NULL OR m.version_status IN ('current', 'under_review'))
@@ -185,9 +207,17 @@ export async function upsertMemoryByFactKey(
        LIMIT 1`
     )
     .bind(input.namespace, input.factKey, input.factKey)
-    .first<{ id: string; authored_by: string | null; response_tendency: string | null }>();
+    .first<{ id: string; type: string | null; authored_by: string | null; response_tendency: string | null }>();
 
   if (existing) {
+    // 原地改写之前先把旧文本存一版，正文没变就不存。
+    await saveMemoryRevision(db, {
+      namespace: input.namespace,
+      memoryId: existing.id,
+      nextContent: input.content,
+      replacedBy: input.source ?? null,
+      reason: "fact_key_upsert"
+    });
     // 更新 memories 本体 (v1 列 + LMC-5 fact_key/version_status)。
     // E 轴两列只在亲手来源时更新；不传就继承已有值 (亲手改内容不该抹掉旧署名)，
     // 与 supersede 的继承原则一致。蒸馏链改写时不碰它们 (亲笔的沿用署名，无主的保持 null)。
@@ -203,7 +233,8 @@ export async function upsertMemoryByFactKey(
       .bind(
         input.content,
         input.summary ?? null,
-        clampMemoryType(input.type, "fact"),
+        // 原地改写一条世界知识还是世界知识：memory_upsert、REST 总会带一个 type (默认 fact)，分不出是不是想改类型。
+        existing.type === WORLD_FACT_TYPE ? WORLD_FACT_TYPE : storedMemoryType(input.type, "fact", input.allowWorldFact),
         input.importance ?? 0.6,
         input.confidence ?? 0.8,
         JSON.stringify(input.tags ?? []),
@@ -234,6 +265,7 @@ export async function upsertMemoryByFactKey(
   }
 
   // 新增：先插 memories 本体 (v1 列 + vector_id + LMC-5 版本列 + E 轴列)，再插侧车行。
+  // updated_at 永远是现在：过期按 updated_at 算，导入的旧日期只放 created_at，不然一导进来就过期。
   const id = newId("mem");
   const vectorId = `mem_${id}`;
   await db
@@ -242,21 +274,22 @@ export async function upsertMemoryByFactKey(
         id, namespace, type, content, summary, importance, confidence, status, pinned,
         tags, source, source_message_ids, vector_id, created_at, updated_at, expires_at,
         fact_key, version_status, superseded_by, authored_by, response_tendency
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, null, ?, 'current', null, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, null, ?, 'current', null, ?, ?)`
     )
     .bind(
       id,
       input.namespace,
-      clampMemoryType(input.type, "fact"),
+      storedMemoryType(input.type, "fact", input.allowWorldFact),
       input.content,
       input.summary ?? null,
       input.importance ?? 0.6,
       input.confidence ?? 0.8,
+      input.pinned ? 1 : 0,
       JSON.stringify(input.tags ?? []),
       input.source ?? null,
       JSON.stringify(input.sourceMessageIds ?? []),
       vectorId,
-      now,
+      input.createdAt || now,
       now,
       input.factKey,
       eAxis.authoredBy,
@@ -390,6 +423,10 @@ export async function supersedeMemory(
     sourceMessageIds?: string[];
     authoredBy?: string | null;
     responseTendency?: string | null;
+    /** 新条的 created_at；不给就是现在 (导入的候选批准时给原来那天)。 */
+    createdAt?: string | null;
+    /** newType=world_fact 时存成世界知识，不收进 8 类 (storedMemoryType)。 */
+    allowWorldFact?: boolean;
   }
 ): Promise<{ oldStatus: string; newId: string }> {
   const db = env.DB;
@@ -447,7 +484,7 @@ export async function supersedeMemory(
       .bind(
         nextId,
         input.namespace,
-        clampMemoryType(input.newType, "fact"),
+        storedMemoryType(input.newType, "fact", input.allowWorldFact),
         input.newContent,
         input.importance ?? 0.6,
         input.confidence ?? 0.8,
@@ -455,7 +492,7 @@ export async function supersedeMemory(
         effectiveSource,
         JSON.stringify(input.sourceMessageIds ?? []),
         nextVectorId,
-        now,
+        input.createdAt || now,
         now,
         newFactKey,
         eAxis.authoredBy,
@@ -514,7 +551,8 @@ export async function supersedeMemory(
     .bind(
       nextId,
       input.namespace,
-      clampMemoryType(input.newType ?? old.type, "fact"),
+      // 没给新类型时继承旧条的：改写一条世界知识，新版本还是世界知识。
+      storedMemoryType(input.newType ?? old.type, "fact", input.allowWorldFact || (input.newType == null && old.type === WORLD_FACT_TYPE)),
       input.newContent,
       input.importance ?? 0.6,
       input.confidence ?? 0.8,
@@ -522,7 +560,7 @@ export async function supersedeMemory(
       effectiveSource,
       JSON.stringify(input.sourceMessageIds ?? []),
       nextVectorId,
-      now,
+      input.createdAt || now,
       now,
       newFactKey,
       nextAuthoredBy,
@@ -731,6 +769,8 @@ export async function deleteMemoryV2(
   }
 
   await db.prepare("DELETE FROM memory_lifecycle WHERE memory_id = ?").bind(input.id).run();
+  // 改写前留的旧版跟着删，不然「删掉」之后旧文本还在。
+  await db.prepare("DELETE FROM memory_revisions WHERE memory_id = ?").bind(input.id).run();
   await db
     .prepare("DELETE FROM memories WHERE namespace = ? AND id = ?")
     .bind(input.namespace, input.id)
@@ -824,6 +864,7 @@ export async function listMemoriesUpdatedInRange(
 
 // 梦境收成 (dream harvest)：当天夜里新写入的记忆，不看 status——
 // 当夜出生又被替代的也算新生，状态交给前端展示。
+// 直接导入的记忆 (source=import) 带着原来的日期，不是那晚整理出来的，不算进收成。
 export async function listMemoriesCreatedInRange(
   db: D1Database,
   input: { namespace: string; startIso: string; endIso: string; limit?: number }
@@ -835,6 +876,7 @@ export async function listMemoriesCreatedInRange(
        FROM memories
        WHERE namespace = ?
          AND created_at >= ? AND created_at < ?
+         AND (source IS NULL OR source != 'import')
        ORDER BY created_at DESC
        LIMIT ?`
     )

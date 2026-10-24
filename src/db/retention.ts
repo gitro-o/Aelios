@@ -199,6 +199,15 @@ async function hardDeleteMemoriesBatch(
   } catch (error) {
     console.error("retention: memory fts hard-delete cleanup failed", error);
   }
+  // 记忆删了，改写前留的旧版也一起删：忘掉就是忘掉。
+  try {
+    await db
+      .prepare(`DELETE FROM memory_revisions WHERE memory_id IN (${placeholders})`)
+      .bind(...ids)
+      .run();
+  } catch (error) {
+    console.error("retention: memory revisions hard-delete cleanup failed", error);
+  }
   const result = await db
     .prepare(
       `DELETE FROM memories WHERE namespace = ? AND id IN (${placeholders})`

@@ -181,8 +181,9 @@ assert.match(dreamExtractSource, /type: clampMemoryType\(readString\(raw\.type\)
 assert.match(dreamExtractSource, /type 只能从这 8 个里选/);
 assert.match(dbV2Source, /import \{ clampMemoryType \} from "(?:\.\.\/)+memory\/canonicalTypes"/);
 assert.match(dbV2Source, /clampMemoryType\(input\.type, "note"\)/);
-assert.match(dbV2Source, /clampMemoryType\(input\.type, "fact"\)/);
-assert.match(dbV2Source, /clampMemoryType\(input\.newType, "fact"\)/);
+// memories.ts writes through storedMemoryType: the eight, plus world_fact only where a caller asks for it.
+assert.match(dbV2Source, /storedMemoryType\(input\.type, "fact", input\.allowWorldFact\)/);
+assert.match(dbV2Source, /storedMemoryType\(input\.newType, "fact", input\.allowWorldFact\)/);
 assert.match(source, /import \{ clampMemoryType \} from "\.\/canonicalTypes"/);
 assert.match(source, /type: clampMemoryType\(input\.type, "note"\),/);
 assert.match(memoriesApiSource, /clampMemoryType\(readString\(body\.type\), "note"\)/);

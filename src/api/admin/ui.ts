@@ -1,3 +1,5 @@
+import { chatParseBrowserScript } from "../../memory/transfer/chatParse";
+
 // 设置页每一项的画法，「常用」和「全部设置」两处共用：开关点了就存，文字改完离开输入框就存。
 const SETTING_ROW = String.raw`<div class="border-t border-zinc-800 py-3" :title="item.name">
                 <template x-if="item.kind === 'switch'">
@@ -23,6 +25,9 @@ const SETTING_ROW = String.raw`<div class="border-t border-zinc-800 py-3" :title
                 </template>
               </div>`;
 const CHEVRON = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`;
+
+// 导入聊天记录时在浏览器里拆文件、按天切段的那几个函数 (跟服务端是同一份代码)。
+const CHAT_PARSE_SCRIPT = chatParseBrowserScript();
 
 export const ADMIN_HTML = String.raw`<!doctype html>
 <html lang="zh-CN">
@@ -297,7 +302,7 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
         <i data-lucide="users" class="h-4 w-4 shrink-0 text-zinc-400"></i>
         <span class="min-w-0 flex-1">
           <span class="block text-[11px] text-zinc-500">查看谁的记忆</span>
-          <span class="block truncate text-sm text-zinc-100" :class="identityLoadError ? 'text-coral' : ''" x-text="viewingLabel()"></span>
+          <span class="block truncate text-sm text-zinc-100" :class="identityLoadError || emptySpaceHint() ? 'text-coral' : ''" x-text="viewingLabel()"></span>
         </span>
         <i data-lucide="chevrons-up-down" class="h-4 w-4 shrink-0 text-zinc-500"></i>
       </button>
@@ -346,7 +351,7 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
         <div class="flex min-w-0 items-center gap-2">
           <button type="button" @click="spaceOpen = true" class="tap flex min-w-0 max-w-[11rem] items-center gap-1.5 rounded-2xl border border-zinc-800 bg-zinc-900 px-3 text-sm text-zinc-100 transition duration-150 ease-in-out active:bg-zinc-800" aria-label="查看谁的记忆">
             <i data-lucide="users" class="h-4 w-4 shrink-0 text-zinc-400"></i>
-            <span class="truncate" :class="identityLoadError ? 'text-coral' : ''" x-text="viewingLabel()"></span>
+            <span class="truncate" :class="identityLoadError || emptySpaceHint() ? 'text-coral' : ''" x-text="viewingLabel()"></span>
             <i data-lucide="chevron-down" class="h-4 w-4 shrink-0 text-zinc-500"></i>
           </button>
           <button type="button" @click="reloadAll()" class="tap rounded-2xl border border-zinc-800 bg-zinc-900 px-3 text-zinc-100 transition duration-150 ease-in-out active:bg-zinc-800" aria-label="刷新">
@@ -413,12 +418,107 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
           <div class="min-w-0 flex-1">
             <h1 class="text-2xl font-semibold">审核队列</h1>
             <p class="mt-1 text-sm text-zinc-400">低置信候选先过手，再进入长期记忆。</p>
-            <p x-show="autoReview === 'clef'" class="mt-1 text-xs leading-6 text-zinc-500">clef 每天夜里自动审，队列里这些下一轮会被定掉，不用一条条批。</p>
-            <p x-show="autoReview !== 'clef'" class="mt-1 text-xs leading-6 text-zinc-500">clef 自动审关着，这些等你批，也可以让助手用 MCP 的 memory_review 自己审。嫌一条条批累：<button type="button" @click="go('settings')" class="text-coral underline-offset-2 hover:underline">去设置</button>打开「每天用 clef 自动审候选」。</p>
+            <p x-show="reviewTab === 'daily' && autoReview === 'clef'" class="mt-1 text-xs leading-6 text-zinc-500">clef 每天夜里自动审，队列里这些下一轮会被定掉，不用一条条批。</p>
+            <p x-show="reviewTab === 'daily' && autoReview !== 'clef'" class="mt-1 text-xs leading-6 text-zinc-500">clef 自动审关着，这些等你批，也可以让助手用 MCP 的 memory_review 自己审。嫌一条条批累：<button type="button" @click="go('settings')" class="text-coral underline-offset-2 hover:underline">去设置</button>打开「每天用 clef 自动审候选」。</p>
           </div>
           <span class="rounded-full bg-coral px-3 py-1 text-sm font-semibold text-zinc-950" x-text="pendingCount"></span>
         </div>
 
+        <div class="flex gap-2">
+          <button type="button" @click="reviewTab = 'daily'; icons()" class="choice-tab tap rounded-2xl border px-4 text-sm transition duration-150 ease-in-out hover:border-coral" :class="reviewTab === 'daily' ? 'is-active' : ''">日常</button>
+          <button type="button" @click="openImportReview()" class="choice-tab tap rounded-2xl border px-4 text-sm transition duration-150 ease-in-out hover:border-coral" :class="reviewTab === 'import' ? 'is-active' : ''">
+            <span>导入的</span><span x-show="importPendingCount" class="ml-1 text-xs" x-text="importPendingCount"></span>
+          </button>
+        </div>
+
+        <div x-show="reviewTab === 'import'" class="space-y-4">
+          <p class="text-xs leading-6 text-zinc-500">从别处导进来的。这些不走夜里的自动审，也不给助手审，等你自己点：通过了才进长期记忆。clef 的分只是参考。</p>
+          <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
+            <div class="grid gap-3 md:grid-cols-[1fr_auto]">
+              <select x-model="importReview.importId" @change="loadImportCandidates(true)" class="h-11 w-full rounded-2xl border border-zinc-800 bg-[#0a0a0b] px-3 text-sm outline-none focus:border-coral">
+                <option value="">全部导入</option>
+                <template x-for="batch in importReview.batches" :key="batch.id">
+                  <option :value="batch.id" x-text="importBatchLabel(batch)"></option>
+                </template>
+              </select>
+              <button type="button" @click="loadImportCandidates(true)" class="tap rounded-2xl border border-zinc-800 px-4 text-sm transition duration-150 ease-in-out hover:border-coral">刷新</button>
+            </div>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <button type="button" @click="importReview.filter = 'all'; loadImportCandidates(true)" class="choice-tab tap rounded-2xl border px-3 text-xs" :class="importReview.filter === 'all' ? 'is-active' : ''" x-text="'全部 ' + importReview.counts.pending"></button>
+              <button type="button" @click="importReview.filter = 'clef_yes'; loadImportCandidates(true)" class="choice-tab tap rounded-2xl border px-3 text-xs" :class="importReview.filter === 'clef_yes' ? 'is-active' : ''" x-text="'clef 觉得该记 ' + importReview.counts.clef_yes"></button>
+              <button type="button" @click="importReview.filter = 'clef_no'; loadImportCandidates(true)" class="choice-tab tap rounded-2xl border px-3 text-xs" :class="importReview.filter === 'clef_no' ? 'is-active' : ''" x-text="'clef 觉得不用 ' + importReview.counts.clef_no"></button>
+            </div>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <button type="button" @click="bulkImportCandidates('approve', 'clef_yes')" :disabled="importReview.bulk || !importReview.counts.clef_yes" class="tap inline-flex items-center gap-2 rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 disabled:opacity-40">
+                <i data-lucide="check-check" class="h-4 w-4"></i><span x-text="'通过 clef 觉得该记的 ' + importReview.counts.clef_yes + ' 条'"></span>
+              </button>
+              <button type="button" @click="bulkImportCandidates('discard', 'clef_no')" :disabled="importReview.bulk || !importReview.counts.clef_no" class="tap inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-4 text-sm text-zinc-100 hover:border-coral disabled:opacity-40">
+                <i data-lucide="x" class="h-4 w-4"></i><span x-text="'丢弃 clef 觉得不用的 ' + importReview.counts.clef_no + ' 条'"></span>
+              </button>
+            </div>
+            <p x-show="importReview.bulk" class="mt-2 text-xs text-zinc-400" x-text="importReview.bulk ? importReview.bulk.label + ' ' + importReview.bulk.done + ' / ' + importReview.bulk.total + (importReview.bulk.failed ? '，失败 ' + importReview.bulk.failed : '') : ''"></p>
+          </article>
+
+          <template x-if="importReview.items.length === 0">
+            <div class="text-keep w-full rounded-2xl border border-zinc-800 bg-zinc-900 p-8 text-sm text-zinc-400" x-text="importReview.loading ? '加载中…' : '这里没有待审的导入候选。'"></div>
+          </template>
+          <template x-for="candidate in importReview.items" :key="candidate.id">
+            <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
+              <div class="mb-3 flex flex-wrap items-center gap-2 text-xs">
+                <span class="chip" x-text="candidate.day || '日期不明'"></span>
+                <span class="rounded-full bg-coral px-2.5 py-1 font-semibold text-zinc-950" x-text="importTypeLabel(candidate.type)"></span>
+                <span class="chip chip-dim" x-text="candidate.source === 'import_chat' ? '聊天记录' : '条目'"></span>
+                <span x-show="candidate.clef_worth !== null && candidate.clef_worth !== undefined" class="chip" :class="clefLooksYes(candidate) ? 'chip-ok' : 'chip-dim'" x-text="clefOpinionLabel(candidate)"></span>
+                <span class="min-w-0 truncate text-zinc-500" x-text="(candidate.tags || []).map(function(tag) { return '#' + tag; }).join(' ')"></span>
+              </div>
+              <div x-show="candidate.existing_content" class="mb-3 rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3 text-xs leading-6 text-zinc-400">
+                <div class="mb-1 text-zinc-500">通过后会替换库里这条：</div>
+                <p class="whitespace-pre-wrap" x-text="candidate.existing_content"></p>
+              </div>
+              <template x-if="!candidate.editing">
+                <p class="whitespace-pre-wrap text-sm leading-7 text-zinc-100" x-text="candidate.content"></p>
+              </template>
+              <template x-if="candidate.editing">
+                <div class="space-y-3">
+                  <textarea x-model="candidate.draft.content" class="min-h-32 w-full resize-y rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3 text-sm outline-none focus:border-coral"></textarea>
+                  <div class="grid gap-3 sm:grid-cols-2">
+                    <input x-model="candidate.draft.type" class="h-11 rounded-2xl border border-zinc-800 bg-[#0a0a0b] px-3 text-sm outline-none focus:border-coral" placeholder="type">
+                    <input x-model="candidate.draft.fact_key" class="h-11 rounded-2xl border border-zinc-800 bg-[#0a0a0b] px-3 text-sm outline-none focus:border-coral" placeholder="fact_key">
+                  </div>
+                </div>
+              </template>
+              <div x-show="candidate.sourcesOpen" class="mt-3 space-y-2 rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3">
+                <template x-if="!candidate.sources">
+                  <p class="text-xs text-zinc-500">加载中…</p>
+                </template>
+                <template x-for="message in (candidate.sources || [])" :key="message.id">
+                  <div class="text-xs leading-6">
+                    <span class="text-zinc-500" x-text="(message.role === 'user' ? '你' : '助手') + (message.created_at ? ' · ' + quoteTime(message.created_at) : '')"></span>
+                    <p class="whitespace-pre-wrap text-zinc-300" x-text="message.content"></p>
+                  </div>
+                </template>
+                <p x-show="candidate.sources && candidate.sources.length === 0" class="text-xs text-zinc-500">这条没有挂原话（整理好的条目本身就是原文）。</p>
+              </div>
+              <div class="mt-4 grid grid-cols-2 gap-3 md:flex md:flex-wrap">
+                <button type="button" @click="approveCandidate(candidate)" class="tap inline-flex items-center justify-center gap-2 rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 transition duration-150 ease-in-out">
+                  <i data-lucide="check" class="h-4 w-4"></i><span>通过</span>
+                </button>
+                <button type="button" @click="discardCandidate(candidate)" class="tap inline-flex items-center justify-center gap-2 rounded-2xl border border-zinc-800 px-4 text-sm text-zinc-100 transition duration-150 ease-in-out hover:border-coral">
+                  <i data-lucide="x" class="h-4 w-4"></i><span>丢弃</span>
+                </button>
+                <button type="button" @click="toggleCandidateEdit(candidate)" class="tap inline-flex items-center justify-center gap-2 rounded-2xl border border-zinc-800 px-4 text-sm text-zinc-100 transition duration-150 ease-in-out hover:border-coral">
+                  <i data-lucide="pencil" class="h-4 w-4"></i><span x-text="candidate.editing ? '取消编辑' : '编辑后通过'"></span>
+                </button>
+                <button type="button" @click="toggleCandidateSources(candidate)" class="tap inline-flex items-center justify-center gap-2 rounded-2xl border border-zinc-800 px-4 text-sm text-zinc-100 transition duration-150 ease-in-out hover:border-coral">
+                  <i data-lucide="quote" class="h-4 w-4"></i><span x-text="candidate.sourcesOpen ? '收起原话' : '看原话'"></span>
+                </button>
+              </div>
+            </article>
+          </template>
+          <button type="button" x-show="importReview.more" @click="loadImportCandidates(false)" class="tap w-full rounded-2xl border border-zinc-800 px-4 text-sm text-zinc-400 transition duration-150 ease-in-out hover:border-coral hover:text-zinc-100">再看 50 条</button>
+        </div>
+
+        <div x-show="reviewTab === 'daily'" class="space-y-4">
         <template x-if="candidates.length === 0">
             <div class="text-keep w-full rounded-2xl border border-zinc-800 bg-zinc-900 p-8 text-sm text-zinc-400">没有待审核候选。</div>
         </template>
@@ -497,6 +597,7 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
             </div>
           </article>
         </template>
+        </div>
       </section>
 
       <section x-show="page === 'memory'" class="space-y-4">
@@ -596,6 +697,9 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
                 <button type="button" @click="memory.mergeOpen = !memory.mergeOpen; icons()" class="tap inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-3 text-sm transition duration-150 ease-in-out hover:border-coral">
                   <i data-lucide="git-merge" class="h-4 w-4"></i><span>合并重复</span>
                 </button>
+                <button type="button" @click="toggleMemoryRevisions(memory)" class="tap inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-3 text-sm transition duration-150 ease-in-out hover:border-coral">
+                  <i data-lucide="history" class="h-4 w-4"></i><span x-text="memory.revOpen ? '收起旧版' : '旧版'"></span>
+                </button>
                 <button type="button" @click="deleteMemory(memory)" class="tap ml-auto inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-3 text-sm text-zinc-400 transition duration-150 ease-in-out hover:border-coral hover:text-zinc-100">
                   <i data-lucide="trash-2" class="h-4 w-4"></i><span>删除</span>
                 </button>
@@ -603,6 +707,23 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
               <div x-show="memory.mergeOpen" class="mt-3 grid gap-3 md:grid-cols-[1fr_auto]">
                 <input x-model="memory.target_id" class="h-11 rounded-2xl border border-zinc-800 bg-[#0a0a0b] px-3 text-sm outline-none focus:border-coral" placeholder="目标 memory id">
                 <button type="button" @click="mergeDuplicate(memory)" class="tap rounded-2xl border border-zinc-800 px-4 text-sm transition duration-150 ease-in-out hover:border-coral">合并</button>
+              </div>
+              <div x-show="memory.revOpen" class="mt-3 space-y-2 rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3">
+                <p class="text-xs leading-6 text-zinc-500">这条被原地改写过的话，改之前的样子都在这里（最多留 20 版）。恢复也是一次改写，现在这版会先存进来。</p>
+                <template x-if="!memory.revisions">
+                  <p class="text-xs text-zinc-500">加载中…</p>
+                </template>
+                <p x-show="memory.revisions && memory.revisions.length === 0" class="text-xs text-zinc-500">没改写过。</p>
+                <template x-for="rev in (memory.revisions || [])" :key="rev.id">
+                  <div class="border-t border-zinc-800 pt-2 text-xs leading-6">
+                    <div class="flex flex-wrap items-center gap-2 text-zinc-500">
+                      <span x-text="'写于 ' + fmt(rev.written_at || rev.created_at)"></span>
+                      <span x-text="revisionReasonLabel(rev)"></span>
+                      <button type="button" @click="restoreMemoryRevision(memory, rev)" class="tap ml-auto rounded-2xl border border-zinc-800 px-3 py-1 text-zinc-400 hover:border-coral hover:text-zinc-100">恢复这版</button>
+                    </div>
+                    <p class="whitespace-pre-wrap text-zinc-300" x-text="rev.content"></p>
+                  </div>
+                </template>
               </div>
             </article>
           </template>
@@ -612,7 +733,7 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
       <section x-show="page === 'more'" class="space-y-4">
         <div>
           <h1 class="text-2xl font-semibold">更多</h1>
-          <p class="mt-1 text-sm text-zinc-400">珍贵、黑话、世界知识和维护入口。</p>
+          <p class="mt-1 text-sm text-zinc-400">珍贵、黑话、小本本、世界知识和维护入口。</p>
         </div>
         <div class="grid grid-cols-2 gap-2 sm:flex">
           <template x-for="item in moreNav" :key="item.id">
@@ -655,6 +776,46 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
           </template>
         </div>
 
+        <div x-show="moreView === 'notebook'" class="space-y-3">
+          <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
+            <p class="text-xs leading-6 text-zinc-500">助手按页名读写的笔记，比如备考进度：做完哪几章、哪里薄弱、下一步做什么。不会被自动召回，夜里不会被改写，也不会过期；用完删掉，或者整本清空。每个空间最多 50 页，每页 2 万字。</p>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <button type="button" @click="newNotebookPage()" class="tap inline-flex items-center gap-2 rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950">
+                <i data-lucide="plus" class="h-4 w-4"></i><span>新建一页</span>
+              </button>
+              <button type="button" @click="clearNotebook()" :disabled="notebookPages.length === 0" class="tap ml-auto inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-4 text-sm text-zinc-400 transition duration-150 ease-in-out hover:border-coral hover:text-zinc-100 disabled:cursor-not-allowed disabled:opacity-40">
+                <i data-lucide="trash-2" class="h-4 w-4"></i><span>全部清空</span>
+              </button>
+            </div>
+          </article>
+          <template x-if="notebookDraft">
+            <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
+              <input x-model="notebookDraft.name" maxlength="60" class="h-11 w-full rounded-2xl border border-zinc-800 bg-[#0a0a0b] px-3 text-sm outline-none focus:border-coral" placeholder="页名，比如 经济师进度">
+              <textarea x-model="notebookDraft.content" class="mt-3 min-h-64 w-full resize-y rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3 text-sm leading-7 outline-none focus:border-coral" placeholder="这一页记什么"></textarea>
+              <div class="mt-2 flex flex-wrap items-center gap-2">
+                <span class="text-xs text-zinc-500" x-text="notebookDraftLabel()"></span>
+                <button type="button" @click="saveNotebookPage()" :disabled="saving" class="tap ml-auto inline-flex items-center gap-2 rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 disabled:opacity-50">
+                  <i data-lucide="save" class="h-4 w-4"></i><span>保存</span>
+                </button>
+                <button type="button" x-show="notebookDraft.id" @click="deleteNotebookPage()" class="tap inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-3 text-sm text-zinc-400 transition duration-150 ease-in-out hover:border-coral hover:text-zinc-100">
+                  <i data-lucide="trash-2" class="h-4 w-4"></i><span>删除</span>
+                </button>
+                <button type="button" @click="notebookDraft = null" class="tap rounded-2xl border border-zinc-800 px-3 text-sm text-zinc-400 hover:border-coral">收起</button>
+              </div>
+            </article>
+          </template>
+          <p x-show="notebookLoaded && notebookPages.length === 0 && !notebookDraft" class="px-1 text-sm text-zinc-500">小本本还是空的。</p>
+          <template x-for="item in notebookPages" :key="item.id">
+            <button type="button" @click="openNotebookPage(item)" class="tap block w-full rounded-2xl border border-zinc-800 bg-zinc-900 p-4 text-left shadow-sm transition duration-150 ease-in-out hover:border-coral">
+              <div class="flex items-center gap-3">
+                <i data-lucide="file-text" class="h-4 w-4 shrink-0 text-coral"></i>
+                <span class="min-w-0 flex-1 truncate font-semibold" x-text="item.name"></span>
+                <span class="shrink-0 text-xs text-zinc-400" x-text="fmt(item.updated_at) + ' · ' + item.size + ' 字'"></span>
+              </div>
+            </button>
+          </template>
+        </div>
+
         <div x-show="moreView === 'world'" class="space-y-3">
           <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
             <div class="grid gap-3 md:grid-cols-[1fr_auto]">
@@ -684,6 +845,132 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
               <p class="whitespace-pre-wrap text-sm leading-7" x-text="item.content"></p>
             </article>
           </template>
+        </div>
+
+        <div x-show="moreView === 'transfer'" class="space-y-3">
+          <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
+            <div class="text-sm font-semibold">导出记忆</div>
+            <p class="mt-1 text-xs leading-6 text-zinc-500">导出「<span x-text="namespace"></span>」这个空间里在用的记忆和珍贵。md 能直接打开改，改完从下面原样导回来（带 fact_key 的会按 key 改写，旧版留着）；jsonl 字段最全，适合备份。</p>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <button type="button" @click="exportMemories('md')" :disabled="transfer.exporting" class="tap inline-flex items-center gap-2 rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 disabled:opacity-50">
+                <i data-lucide="download" class="h-4 w-4"></i><span>导出 md</span>
+              </button>
+              <button type="button" @click="exportMemories('jsonl')" :disabled="transfer.exporting" class="tap inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-4 text-sm hover:border-coral disabled:opacity-50">
+                <i data-lucide="download" class="h-4 w-4"></i><span>导出 jsonl</span>
+              </button>
+            </div>
+          </article>
+
+          <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
+            <div class="text-sm font-semibold">导入整理好的条目</div>
+            <p class="mt-1 text-xs leading-6 text-zinc-500">一行一条：<span class="font-mono">- 2025-12-15 [偏好] 内容 #标签</span>。日期、类型、标签都可以没有。Aelios 导出的 md / jsonl 原样能导回来；普通的 md 列表、一段段的文字也认，一段算一条。导进「<span x-text="namespace"></span>」。</p>
+            <details class="mt-3 rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3">
+              <summary class="cursor-pointer text-xs text-zinc-400">从别的 AI 搬：让它按这个格式把记得的事列出来</summary>
+              <pre class="mt-2 whitespace-pre-wrap text-xs leading-6 text-zinc-300" x-text="transfer.info ? transfer.info.prompt : '加载中…'"></pre>
+              <button type="button" @click="copyImportPrompt()" class="tap mt-2 rounded-2xl border border-zinc-800 px-3 text-xs hover:border-coral">复制提示词</button>
+            </details>
+            <textarea x-model="transfer.entriesText" @input="transfer.preview = null; transfer.entriesName = ''" class="mt-3 min-h-40 w-full resize-y rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3 text-sm leading-7 outline-none focus:border-coral" placeholder="把清单粘贴进来，或者选一个文件"></textarea>
+            <div class="mt-2 flex flex-wrap items-center gap-2">
+              <label class="tap inline-flex cursor-pointer items-center gap-2 rounded-2xl border border-zinc-800 px-4 text-sm hover:border-coral">
+                <i data-lucide="file-up" class="h-4 w-4"></i><span>选文件</span>
+                <input type="file" accept=".md,.markdown,.txt,.json,.jsonl" class="hidden" @change="loadEntriesFile($event)">
+              </label>
+              <button type="button" @click="previewEntries()" :disabled="!transfer.entriesText.trim() || transfer.entriesBusy" class="tap rounded-2xl border border-zinc-800 px-4 text-sm hover:border-coral disabled:opacity-40">先看看认出了什么</button>
+            </div>
+            <template x-if="transfer.preview">
+              <div class="mt-3 space-y-3">
+                <p class="text-sm text-zinc-300" x-text="entriesPreviewLabel()"></p>
+                <template x-for="warning in transfer.preview.warnings" :key="warning">
+                  <p class="text-xs text-amber-300/80" x-text="warning"></p>
+                </template>
+                <div class="max-h-72 space-y-1 overflow-auto rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3">
+                  <template x-for="(entry, index) in transfer.preview.entries.slice(0, 50)" :key="index">
+                    <div class="text-xs leading-6 text-zinc-300">
+                      <span class="text-zinc-500" x-text="(entry.date || '') + ' ' + (entry.kind === 'precious' ? '珍贵' : importTypeLabel(entry.type || 'fact'))"></span>
+                      <span x-text="entry.content"></span>
+                      <span class="text-zinc-500" x-text="(entry.tags || []).map(function(tag) { return '#' + tag; }).join(' ')"></span>
+                    </div>
+                  </template>
+                  <p x-show="transfer.preview.entries.length > 50" class="text-xs text-zinc-500" x-text="'……还有 ' + (transfer.preview.entries.length - 50) + ' 条'"></p>
+                </div>
+                <div class="grid gap-2 text-sm">
+                  <label class="flex items-start gap-2"><input type="radio" value="direct" x-model="transfer.entriesMode" class="mt-1.5 accent-[#ff7a66]"><span>直接写进库。一字不差的跳过，跟库里某条很像的不硬写，转去审核页「导入的」。</span></label>
+                  <label class="flex items-start gap-2"><input type="radio" value="review" x-model="transfer.entriesMode" class="mt-1.5 accent-[#ff7a66]"><span>全部先进审核页「导入的」，一条条过。</span></label>
+                  <p class="text-xs text-zinc-500">标成珍贵的两种都直接收进珍贵。</p>
+                </div>
+                <button type="button" @click="runEntriesImport()" :disabled="transfer.entriesBusy || !transfer.preview.total" class="tap inline-flex items-center gap-2 rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 disabled:opacity-40">
+                  <i data-lucide="upload" class="h-4 w-4"></i><span x-text="'导入 ' + transfer.preview.total + ' 条'"></span>
+                </button>
+              </div>
+            </template>
+            <p x-show="transfer.entriesRun" class="mt-3 text-sm text-zinc-300" x-text="entriesRunLabel()"></p>
+          </article>
+
+          <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
+            <div class="text-sm font-semibold">导入聊天记录</div>
+            <p class="mt-1 text-xs leading-6 text-zinc-500">认得 ChatGPT、Claude 导出的 conversations.json，酒馆的 .jsonl，还有「名字：内容」一句一行的文本。文件在这个页面里拆开，按天切段，一段段交给整理记忆的模型读；抽出来的只进审核页「导入的」，你点了才算数。原话只存被引用的那几句，不进聊天记录表，不会被 7 天清理吃掉，也不会被夜里再整理一遍。导进「<span x-text="namespace"></span>」。</p>
+            <label class="tap mt-3 inline-flex cursor-pointer items-center gap-2 rounded-2xl border border-zinc-800 px-4 text-sm hover:border-coral">
+              <i data-lucide="file-up" class="h-4 w-4"></i><span>选聊天记录文件</span>
+              <input type="file" accept=".json,.jsonl,.txt,.md,.markdown" class="hidden" @change="loadChatFile($event)">
+            </label>
+            <p x-show="transfer.chatLoading" class="mt-2 text-xs text-zinc-400">在读文件…</p>
+            <template x-if="transfer.chat">
+              <div class="mt-3 space-y-3">
+                <p class="text-sm text-zinc-300" x-text="chatSummaryLabel()"></p>
+                <template x-for="warning in transfer.chat.warnings" :key="warning">
+                  <p class="text-xs text-amber-300/80" x-text="warning"></p>
+                </template>
+                <div x-show="transfer.chat.needsRoles" class="rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3">
+                  <p class="text-xs text-zinc-400">文件里是按名字分的，勾上哪些名字是你，其余算助手：</p>
+                  <div class="mt-2 flex flex-wrap gap-2">
+                    <template x-for="speaker in transfer.chat.speakers" :key="speaker.name">
+                      <label class="inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-3 py-1 text-sm">
+                        <input type="checkbox" :checked="speaker.isUser" @change="speaker.isUser = $event.target.checked; rechunkChat()" class="accent-[#ff7a66]">
+                        <span x-text="speaker.name"></span><span class="text-xs text-zinc-500" x-text="speaker.count"></span>
+                      </label>
+                    </template>
+                  </div>
+                </div>
+                <label x-show="transfer.info && transfer.info.clef.available" class="flex items-start gap-2 text-sm">
+                  <input type="checkbox" x-model="transfer.chatClef" class="mt-1.5 accent-[#ff7a66]">
+                  <span>每条候选让 clef 顺手打个分（有依据、值得记），审核页能按它筛。只是参考，记不记还是你点。会多一点 Workers AI 用量。</span>
+                </label>
+                <div class="flex flex-wrap gap-2">
+                  <button type="button" x-show="!transfer.chatRun || (!transfer.chatRun.running && transfer.chatRun.done < transfer.chatRun.total)" @click="runChatImport()" :disabled="!transfer.chat.chunks" class="tap inline-flex items-center gap-2 rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 disabled:opacity-40">
+                    <i data-lucide="play" class="h-4 w-4"></i><span x-text="transfer.chatRun && transfer.chatRun.done ? '接着做' : '开始'"></span>
+                  </button>
+                  <button type="button" x-show="transfer.chatRun && transfer.chatRun.running" @click="transfer.chatRun.stop = true" class="tap inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-4 text-sm hover:border-coral">
+                    <i data-lucide="pause" class="h-4 w-4"></i><span x-text="transfer.chatRun && transfer.chatRun.stop ? '这段做完就停' : '暂停'"></span>
+                  </button>
+                  <button type="button" x-show="transfer.chatRun && transfer.chatRun.candidates" @click="go('review'); openImportReview(transfer.chatRun.importId)" class="tap inline-flex items-center gap-2 rounded-2xl border border-zinc-800 px-4 text-sm hover:border-coral">
+                    <i data-lucide="inbox" class="h-4 w-4"></i><span>去审核</span>
+                  </button>
+                </div>
+                <template x-if="transfer.chatRun">
+                  <div class="space-y-2">
+                    <div class="h-2 overflow-hidden rounded-full bg-zinc-800"><div class="h-full bg-coral transition-all" :style="'width:' + chatRunPercent() + '%'"></div></div>
+                    <p class="text-xs leading-6 text-zinc-400" x-text="chatRunLabel()"></p>
+                    <p x-show="transfer.chatRun.lastError" class="text-xs text-amber-300/80" x-text="'出错：' + transfer.chatRun.lastError"></p>
+                  </div>
+                </template>
+                <p class="text-xs text-zinc-500">页面开着才会跑。关了也没事，下次选同一个文件、同样的勾选，做完的段会跳过，接着做。</p>
+              </div>
+            </template>
+          </article>
+
+          <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
+            <div class="flex items-center justify-between gap-3">
+              <div class="text-sm font-semibold">导入过的</div>
+              <button type="button" @click="loadImportBatches()" class="tap rounded-2xl border border-zinc-800 px-3 text-xs hover:border-coral">刷新</button>
+            </div>
+            <p x-show="transfer.batches.length === 0" class="mt-2 text-xs text-zinc-500">这个空间还没导入过。</p>
+            <template x-for="batch in transfer.batches" :key="batch.id">
+              <div class="mt-2 border-t border-zinc-800 pt-2 text-xs leading-6 text-zinc-400">
+                <div class="text-zinc-200" x-text="importBatchLabel(batch)"></div>
+                <div x-text="importBatchDetail(batch)"></div>
+              </div>
+            </template>
+          </article>
         </div>
 
         <div x-show="moreView === 'maintenance'" class="space-y-3">
@@ -1271,11 +1558,15 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
               <template x-for="idn in memoryIdentities" :key="idn.slug"><option :value="idn.slug" x-text="idn.slug"></option></template>
             </select>
           </label>
-          <label class="text-xs text-zinc-400" x-show="selectedIdentity">空间
-            <select x-model="namespace" @change="switchSpace($event.target.value)" class="mt-2 h-11 w-full rounded-xl border border-zinc-800 bg-[#0a0a0b] px-3 text-sm text-zinc-100">
-              <template x-for="space in identitySpaces()" :key="space.name"><option :value="space.name" x-text="space.label"></option></template>
+          <label class="text-xs text-zinc-400">空间
+            <select x-model="namespace" @change="pickSpace($event.target.value)" class="mt-2 h-11 w-full rounded-xl border border-zinc-800 bg-[#0a0a0b] px-3 text-sm text-zinc-100">
+              <template x-for="space in pickerSpaces()" :key="space.name"><option :value="space.name" x-text="space.label"></option></template>
             </select>
           </label>
+        </div>
+        <div x-show="emptySpaceHint()" class="mt-3 flex items-center justify-between gap-3 rounded-xl border border-coral/40 bg-[#0a0a0b] p-3">
+          <p class="text-xs leading-5 text-zinc-300" x-text="emptySpaceHint() && emptySpaceHint().text"></p>
+          <button type="button" @click="pickSpace(emptySpaceHint().space)" class="tap shrink-0 rounded-xl border border-coral px-3 text-xs text-coral transition hover:bg-coral hover:text-zinc-950" x-text="emptySpaceHint() && ('看 ' + emptySpaceHint().space)"></button>
         </div>
         <p class="mt-2 text-xs leading-6 text-zinc-400" x-text="spaceDescription()"></p>
         <p class="text-xs leading-6 text-zinc-500">这里切换查看的记忆；客户端使用哪位助手由接入地址和钥匙决定。</p>
@@ -1317,9 +1608,15 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
 </div>
 
 <script>
+${CHAT_PARSE_SCRIPT}
+</script>
+<script>
 function memoryAdmin() {
   // 设置一项项排队存，连点两个开关也不会互相盖掉。放在外面，不进 Alpine 的响应式。
   let settingsQueue = Promise.resolve();
+  // 导入聊天记录时读出来的整份消息和切好的段，可能上万条，放在外面不进响应式，页面上只显示数。
+  let chatParsed = null;
+  let chatChunks = [];
   return {
     nav: [
       { id: 'today', label: '今日', icon: 'sun' },
@@ -1334,7 +1631,9 @@ function memoryAdmin() {
     moreNav: [
       { id: 'precious', label: '珍贵' },
       { id: 'glossary', label: '黑话' },
+      { id: 'notebook', label: '小本本' },
       { id: 'world', label: '世界知识' },
+      { id: 'transfer', label: '导入导出' },
       { id: 'maintenance', label: '维护' }
     ],
     canonicalMemoryTypes: ['fact', 'event', 'preference', 'relationship', 'boundary', 'habit', 'decision', 'note'],
@@ -1385,6 +1684,9 @@ function memoryAdmin() {
     memories: [],
     precious: [],
     glossary: [],
+    notebookPages: [],
+    notebookDraft: null,
+    notebookLoaded: false,
 
     diaryDailies: [],
     diaryWeeklies: [],
@@ -1414,6 +1716,10 @@ function memoryAdmin() {
     dreamHarvestLoading: false,
     dreamExpanded: {},
     harvestOpen: { new: true, dim: true, judged: true },
+
+    reviewTab: 'daily',
+    importReview: { batches: [], importId: '', filter: 'all', items: [], counts: { pending: 0, clef_yes: 0, clef_no: 0 }, offset: 0, more: false, loading: false, bulk: null },
+    transfer: { info: null, exporting: false, entriesText: '', entriesName: '', preview: null, entriesMode: 'direct', entriesBusy: false, entriesRun: null, chat: null, chatLoading: false, chatClef: true, chatRun: null, batches: [] },
 
     async init() {
       this.applyTheme();
@@ -1539,6 +1845,36 @@ function memoryAdmin() {
       return [...new Set([write, ...reads])].map(name => ({ name: name,
         label: name + (name === write ? ' · 写入空间' : ' · 召回空间') }));
     },
+    // 没选助手时列出 default、所有有记忆的空间和正在看的这个，没配助手也能点回装着记忆的空间。
+    pickerSpaces() {
+      if (this.currentIdentity()) return this.identitySpaces();
+      const counts = this.gwSpaces;
+      const names = [...new Set(['default', ...counts.map(space => space.namespace), this.namespace || 'default'])];
+      return names.map(name => {
+        const found = counts.find(space => space.namespace === name);
+        const note = found ? ' · ' + found.memories + ' 条' : counts.length ? ' · 没有记忆' : '';
+        return { name: name, label: name + note };
+      });
+    },
+    pickSpace(name) {
+      const idn = this.currentIdentity();
+      if (idn && this.identitySpaces().some(space => space.name === name)) return this.switchSpace(name);
+      return this.selectCustomSpace(name);
+    },
+    // 自选空间时正在看的空间没有记忆、别的空间有，就提醒一句（多半是浏览器还记着一个旧空间名）。
+    // 助手自己的空间是空的不在这里提醒：设置页的 gwSpaceHint 管那种情况，这里点过去会摘掉助手。
+    emptySpaceHint() {
+      if (this.currentIdentity()) return null;
+      const current = this.namespace || 'default';
+      if (this.gwSpaces.some(space => space.namespace === current && space.memories > 0)) return null;
+      const best = this.gwSpaces.find(space => space.memories > 0);
+      if (!best) return null;
+      return { space: best.namespace, text: '「' + current + '」里还没有记忆，' + best.namespace + ' 里有 ' + best.memories + ' 条。' };
+    },
+    async loadSpaces() {
+      // 各空间的记忆条数只用来提醒和列空间，读不到不影响别的。
+      try { this.gwSpaces = (await this.request('/api/gateway/spaces')).spaces || []; } catch { this.gwSpaces = []; }
+    },
     spaceDescription() {
       const idn = this.currentIdentity();
       if (!idn) return '当前查看：' + this.namespace;
@@ -1632,8 +1968,13 @@ function memoryAdmin() {
       this.boot = {}; this.stats = {};
       this.todayMessages = []; this.candidates = []; this.judgeDecisions = []; this.memories = [];
       this.precious = []; this.glossary = [];
+      this.notebookPages = []; this.notebookDraft = null; this.notebookLoaded = false;
       this.diaryDailies = []; this.diaryWeeklies = []; this.diaryExpanded = {};
       this.worldItems = []; this.worldSelection = {}; this.worldQuery = '';
+      this.importReview = { batches: [], importId: '', filter: 'all', items: [], counts: { pending: 0, clef_yes: 0, clef_no: 0 }, offset: 0, more: false, loading: false, bulk: null };
+      // 正在跑的聊天导入带着自己的空间，换空间不打断它；别的导入状态跟着空间清掉。
+      this.transfer.info = null; this.transfer.preview = null; this.transfer.entriesRun = null; this.transfer.batches = [];
+      if (this.transfer.chatRun && !this.transfer.chatRun.running) this.transfer.chatRun = null;
       this.memoryCreateOpen = false;
       this.memoryDraft = { type: 'fact', content: '', fact_key: '', importance: 0.7, confidence: 0.85 };
       this.glossaryDraft = { term: '', definition: '', aliasesText: '' };
@@ -1766,8 +2107,7 @@ function memoryAdmin() {
             _open: false
           };
         });
-        // 各空间的记忆条数只用来提醒，读不到不影响别的。
-        try { this.gwSpaces = (await this.request('/api/gateway/spaces')).spaces || []; } catch { this.gwSpaces = []; }
+        await this.loadSpaces();
         const envData = await this.request('/api/gateway/env');
         (envData.groups || []).forEach(function(g) {
           g.items.forEach(function(item) { item.value = item.value || ''; item.saved = item.value; item.busy = false; });
@@ -1841,11 +2181,14 @@ function memoryAdmin() {
     },
     async reloadAll() {
       this.savePrefs();
-      var tasks = [this.loadBoot(), this.loadCandidates(), this.loadMemories()];
+      var tasks = [this.loadBoot(), this.loadCandidates(), this.loadMemories(), this.loadSpaces()];
       if (this.page === 'review') tasks.push(this.loadJudgeDecisions());
       if (this.page === 'settings') tasks.push(this.loadRecallHistory());
       if (this.page === 'diary') tasks.push(this.loadDiary());
       if (this.page === 'more' && this.moreView === 'world') tasks.push(this.loadWorldFacts());
+      if (this.page === 'more' && this.moreView === 'notebook') tasks.push(this.loadNotebook());
+      if (this.page === 'more' && this.moreView === 'transfer') tasks.push(this.loadTransferInfo(), this.loadImportBatches());
+      if (this.page === 'review' && this.reviewTab === 'import') tasks.push(this.loadImportBatches(), this.loadImportCandidates(true));
       if (this.page === 'dream') {
         tasks.push(this.loadDreamStatus());
         tasks.push(this.loadDreamHarvest());
@@ -1879,7 +2222,8 @@ function memoryAdmin() {
     async loadCandidates() {
       const revision = this.spaceRevision;
       try {
-        const data = await this.request(this.withNamespace('/v1/candidates?status=pending&limit=100'));
+        // 日常这一栏只要整理出来的；导入的在「导入的」那一栏单独翻页。
+        const data = await this.request(this.withNamespace('/v1/candidates?status=pending&limit=100&scope=daily'));
         if (revision !== this.spaceRevision) return;
         this.candidates = (data.data || []).map(function(item) {
           item.editing = false;
@@ -1945,6 +2289,8 @@ function memoryAdmin() {
           item.mergeOpen = false;
           item.target_id = '';
           item.draft = { content: item.content };
+          item.revOpen = false;
+          item.revisions = null;
           return item;
         });
       } catch (error) {
@@ -1955,6 +2301,12 @@ function memoryAdmin() {
     loadMoreView() {
       if (this.moreView === 'world') {
         this.loadWorldFacts();
+      } else if (this.moreView === 'notebook') {
+        this.loadNotebook();
+      } else if (this.moreView === 'transfer') {
+        this.loadTransferInfo();
+        this.loadImportBatches();
+        this.icons();
       } else {
         this.icons();
       }
@@ -2011,7 +2363,12 @@ function memoryAdmin() {
           method: 'POST',
           body: JSON.stringify(this.candidatePayload(candidate))
         });
-        await Promise.all([this.loadCandidates(), this.loadMemories(), this.loadBoot()]);
+        if (candidate.import_id) {
+          this.dropImportCandidate(candidate);
+          await Promise.all([this.loadMemories(), this.loadBoot()]);
+        } else {
+          await Promise.all([this.loadCandidates(), this.loadMemories(), this.loadBoot()]);
+        }
         this.notify('已通过');
       } catch (error) {
         this.notify(error.message);
@@ -2023,7 +2380,12 @@ function memoryAdmin() {
           method: 'POST',
           body: JSON.stringify({ namespace: this.namespace })
         });
-        await Promise.all([this.loadCandidates(), this.loadBoot()]);
+        if (candidate.import_id) {
+          this.dropImportCandidate(candidate);
+          await this.loadBoot();
+        } else {
+          await Promise.all([this.loadCandidates(), this.loadBoot()]);
+        }
         this.notify('已丢弃');
       } catch (error) {
         this.notify(error.message);
@@ -2261,6 +2623,93 @@ function memoryAdmin() {
         await this.request(this.withNamespace('/v1/glossary/' + encodeURIComponent(item.id)), { method: 'DELETE' });
         await this.loadBoot();
         this.notify('黑话已删除');
+      } catch (error) {
+        this.notify(error.message);
+      }
+    },
+    async loadNotebook() {
+      const revision = this.spaceRevision;
+      try {
+        const data = await this.request(this.withNamespace('/v1/notebook'));
+        if (revision !== this.spaceRevision) return;
+        this.notebookPages = data.data || [];
+        this.notebookLoaded = true;
+      } catch (error) {
+        if (revision !== this.spaceRevision) return;
+        this.notify(error.message);
+      }
+      this.icons();
+    },
+    newNotebookPage() {
+      this.notebookDraft = { id: '', name: '', content: '', updated_at: '' };
+      this.icons();
+    },
+    async openNotebookPage(item) {
+      const revision = this.spaceRevision;
+      try {
+        const data = await this.request(this.withNamespace('/v1/notebook/' + encodeURIComponent(item.id)));
+        if (revision !== this.spaceRevision) return;
+        const page = data.data || {};
+        this.notebookDraft = { id: page.id, name: page.name, content: page.content, updated_at: page.updated_at };
+      } catch (error) {
+        this.notify(error.message);
+      }
+      this.icons();
+    },
+    notebookDraftLabel() {
+      const draft = this.notebookDraft;
+      if (!draft) return '';
+      const size = Array.from(draft.content || '').length + ' / 20000 字';
+      return draft.updated_at ? size + ' · 改于 ' + this.fmt(draft.updated_at) : size + ' · 新的一页';
+    },
+    async saveNotebookPage() {
+      const draft = this.notebookDraft;
+      if (!draft) return;
+      // 和服务端一样：去头尾空白，中间连续空白并成一个空格。
+      const name = String(draft.name || '').replace(/\s+/g, ' ').trim();
+      if (!name || !String(draft.content || '').trim()) {
+        this.notify('页名和内容都要填');
+        return;
+      }
+      if (!draft.id && this.notebookPages.some(function(item) { return item.name === name; })) {
+        if (!window.confirm('已经有一页叫「' + name + '」，确认用这次写的整页替换它？')) return;
+      }
+      this.saving = true;
+      try {
+        const body = JSON.stringify({ namespace: this.namespace, name: name, content: draft.content });
+        const data = draft.id
+          ? await this.request(this.withNamespace('/v1/notebook/' + encodeURIComponent(draft.id)), { method: 'PATCH', body: body })
+          : await this.request(this.withNamespace('/v1/notebook'), { method: 'POST', body: body });
+        const page = data.data || {};
+        this.notebookDraft = { id: page.id, name: page.name, content: page.content, updated_at: page.updated_at };
+        await this.loadNotebook();
+        this.notify('这一页已保存');
+      } catch (error) {
+        this.notify(error.message);
+      }
+      this.saving = false;
+    },
+    async deleteNotebookPage() {
+      const draft = this.notebookDraft;
+      if (!draft || !draft.id) return;
+      if (!window.confirm('确认删除「' + draft.name + '」这一页？')) return;
+      try {
+        await this.request(this.withNamespace('/v1/notebook/' + encodeURIComponent(draft.id)), { method: 'DELETE' });
+        this.notebookDraft = null;
+        await this.loadNotebook();
+        this.notify('这一页已删除');
+      } catch (error) {
+        this.notify(error.message);
+      }
+    },
+    async clearNotebook() {
+      if (this.notebookPages.length === 0) return;
+      if (!window.confirm('确认清空小本本？「' + this.namespace + '」里的 ' + this.notebookPages.length + ' 页会全部删掉，找不回来。')) return;
+      try {
+        const data = await this.request(this.withNamespace('/v1/notebook?confirm=all'), { method: 'DELETE' });
+        this.notebookDraft = null;
+        await this.loadNotebook();
+        this.notify('小本本已清空，删了 ' + ((data.data && data.data.deleted) || 0) + ' 页');
       } catch (error) {
         this.notify(error.message);
       }
@@ -2648,6 +3097,514 @@ function memoryAdmin() {
       const total = rows.reduce(function(sum, row) { return sum + Number(row.count || 0); }, 0);
       const cap = Object.keys(this.limits).reduce(function(sum, key) { return sum + this.limits[key]; }.bind(this), 0);
       return total + '/' + cap;
+    },
+    // ===== 导入导出 =====
+    nsPath(path, ns) {
+      const sep = path.indexOf('?') === -1 ? '?' : '&';
+      return path + sep + 'namespace=' + encodeURIComponent(ns || 'default');
+    },
+    async sha256(text) {
+      const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+      return Array.from(new Uint8Array(buf)).map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+    },
+    fmtTokens(value) {
+      const n = Number(value || 0);
+      if (n >= 10000) return (n / 10000).toFixed(n >= 100000 ? 0 : 1) + ' 万';
+      return String(n);
+    },
+    quoteTime(value) {
+      // 只知道哪天的原话就是 YYYY-MM-DD；有时间的换成本地时间显示。
+      if (!value || /^\d{4}-\d{2}-\d{2}$/.test(value)) return value || '';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      const pad = function(n) { return String(n).padStart(2, '0'); };
+      return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+    },
+    importTypeLabel(type) {
+      return { fact: '事实', event: '事件', preference: '偏好', relationship: '关系', boundary: '边界', habit: '习惯', decision: '决定', note: '笔记' }[type] || type || '事实';
+    },
+    get importPendingCount() {
+      return (this.stats && this.stats.pending_import_candidates) || 0;
+    },
+    async loadTransferInfo() {
+      const revision = this.spaceRevision;
+      try {
+        const data = await this.request(this.withNamespace('/v1/import/info'));
+        if (revision !== this.spaceRevision) return;
+        this.transfer.info = data.data || null;
+      } catch (error) {
+        if (revision === this.spaceRevision) this.notify(error.message);
+      }
+    },
+    async loadImportBatches() {
+      const revision = this.spaceRevision;
+      try {
+        const data = await this.request(this.withNamespace('/v1/import/batches?limit=50'));
+        if (revision !== this.spaceRevision) return;
+        this.transfer.batches = data.data || [];
+        this.importReview.batches = this.transfer.batches;
+      } catch (error) {
+        if (revision === this.spaceRevision) this.notify(error.message);
+      }
+    },
+    importBatchLabel(batch) {
+      const kind = batch.kind === 'chat' ? '聊天记录' : '条目';
+      const range = batch.first_date ? '（' + batch.first_date + (batch.last_date && batch.last_date !== batch.first_date ? ' 到 ' + batch.last_date : '') + '）' : '';
+      return kind + ' · ' + (batch.name || '没起名') + range;
+    },
+    importBatchDetail(batch) {
+      const review = '待审 ' + (batch.pending || 0) + '，通过 ' + (batch.approved || 0) + '，丢弃 ' + (batch.discarded || 0);
+      if (batch.kind !== 'chat') return (batch.total_messages || 0) + ' 条，' + (batch.candidates || 0) + ' 条进了审核（' + review + '）';
+      return '做了 ' + (batch.done_chunks || 0) + ' / ' + (batch.total_chunks || 0) + ' 段，' + (batch.candidates || 0) + ' 条候选（' + review + '），模型 ' + (batch.model_calls || 0) + ' 次，'
+        + this.fmtTokens(batch.tokens_in) + ' 进 / ' + this.fmtTokens(batch.tokens_out) + ' 出 token' + (batch.clef_calls ? '，clef ' + batch.clef_calls + ' 次' : '');
+    },
+    prepareCandidate(item) {
+      item.editing = false;
+      item.mergeOpen = false;
+      item.target_id = '';
+      item.draft = { content: item.content, type: item.type, fact_key: item.fact_key || '' };
+      item.sourcesOpen = false;
+      item.sources = null;
+      return item;
+    },
+    openImportReview(importId) {
+      this.reviewTab = 'import';
+      if (typeof importId === 'string') this.importReview.importId = importId;
+      this.loadImportBatches();
+      this.loadImportCandidates(true);
+    },
+    importCandidatesPath(extra) {
+      const state = this.importReview;
+      let path = '/v1/import/candidates' + extra + (extra.indexOf('?') === -1 ? '?' : '&') + 'filter=' + encodeURIComponent(state.filter);
+      if (state.importId) path += '&import_id=' + encodeURIComponent(state.importId);
+      return this.withNamespace(path);
+    },
+    async loadImportCandidates(reset) {
+      const revision = this.spaceRevision;
+      const state = this.importReview;
+      if (reset) state.offset = 0;
+      state.loading = true;
+      try {
+        const data = await this.request(this.importCandidatesPath('?limit=50&offset=' + state.offset));
+        if (revision !== this.spaceRevision) return;
+        const items = (data.data || []).map(this.prepareCandidate);
+        state.items = reset ? items : state.items.concat(items);
+        state.counts = data.counts || { pending: 0, clef_yes: 0, clef_no: 0 };
+        state.offset += items.length;
+        state.more = items.length === 50;
+      } catch (error) {
+        if (revision === this.spaceRevision) this.notify(error.message);
+      }
+      state.loading = false;
+      this.icons();
+    },
+    async refreshImportCounts() {
+      const revision = this.spaceRevision;
+      try {
+        const data = await this.request(this.importCandidatesPath('?limit=1'));
+        if (revision !== this.spaceRevision) return;
+        this.importReview.counts = data.counts || this.importReview.counts;
+      } catch (error) { /* 数字下次刷新再对 */ }
+    },
+    dropImportCandidate(candidate) {
+      const state = this.importReview;
+      const before = state.items.length;
+      state.items = state.items.filter(function(item) { return item.id !== candidate.id; });
+      if (state.items.length < before) state.offset = Math.max(state.offset - 1, 0);
+      this.refreshImportCounts();
+    },
+    clefLooksYes(candidate) {
+      return Number(candidate.clef_grounded) >= 0.5 && Number(candidate.clef_worth) >= 0.5;
+    },
+    clefOpinionLabel(candidate) {
+      return 'clef：有依据 ' + this.pct(candidate.clef_grounded) + '，' + (candidate.target_memory_id ? '该替换 ' : '值得记 ') + this.pct(candidate.clef_worth);
+    },
+    async toggleCandidateSources(candidate) {
+      candidate.sourcesOpen = !candidate.sourcesOpen;
+      if (!candidate.sourcesOpen || candidate.sources) return;
+      try {
+        const data = await this.request(this.withNamespace('/v1/candidates/' + encodeURIComponent(candidate.id) + '/sources'));
+        candidate.sources = (data.data && data.data.messages) || [];
+      } catch (error) {
+        candidate.sources = [];
+        this.notify(error.message);
+      }
+    },
+    async bulkImportCandidates(action, filter) {
+      const state = this.importReview;
+      const total = filter === 'clef_yes' ? state.counts.clef_yes : state.counts.clef_no;
+      const label = action === 'approve' ? '通过' : '丢弃';
+      const warning = action === 'approve' ? '通过的直接进长期记忆。' : '丢弃的不会进记忆。';
+      if (!total || !window.confirm(label + ' ' + total + ' 条？' + warning)) return;
+      const ns = this.namespace;
+      const self = this;
+      try {
+        let path = '/v1/import/candidates/ids?filter=' + filter;
+        if (state.importId) path += '&import_id=' + encodeURIComponent(state.importId);
+        const data = await this.request(this.nsPath(path, ns));
+        const ids = data.data || [];
+        state.bulk = { label: '在' + label, done: 0, total: ids.length, failed: 0 };
+        let cursor = 0;
+        const worker = async function() {
+          while (cursor < ids.length) {
+            const id = ids[cursor++];
+            try {
+              await self.request(self.nsPath('/v1/candidates/' + encodeURIComponent(id) + '/' + action, ns), {
+                method: 'POST',
+                body: JSON.stringify({ namespace: ns })
+              });
+            } catch (error) {
+              state.bulk.failed += 1;
+            }
+            state.bulk.done += 1;
+          }
+        };
+        await Promise.all([worker(), worker(), worker()]);
+        const failed = state.bulk.failed;
+        state.bulk = null;
+        this.notify(label + '了 ' + (ids.length - failed) + ' 条' + (failed ? '，' + failed + ' 条没成功' : ''));
+      } catch (error) {
+        state.bulk = null;
+        this.notify(error.message);
+      }
+      if (ns !== this.namespace) return;
+      await Promise.all([this.loadImportCandidates(true), this.loadImportBatches(), this.loadBoot(), this.loadMemories()]);
+    },
+    async exportMemories(format) {
+      this.transfer.exporting = true;
+      try {
+        if (!this.apiKey.trim()) throw new Error('请先填写 token');
+        const response = await fetch(this.base() + this.withNamespace('/v1/memories/export?format=' + format), {
+          headers: { Authorization: 'Bearer ' + this.apiKey }
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          let message = response.status + ' ' + response.statusText;
+          try { message = JSON.parse(text).error.message || message; } catch (error) { /* 不是 JSON 就用状态码 */ }
+          throw new Error(message);
+        }
+        const blob = await response.blob();
+        const disposition = response.headers.get('content-disposition') || '';
+        const match = /filename="?([^";]+)"?/.exec(disposition);
+        const name = match ? match[1] : 'aelios-' + this.namespace + '.' + format;
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = name;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(function() { URL.revokeObjectURL(url); }, 2000);
+        const count = response.headers.get('x-aelios-memories');
+        this.notify(count ? '导出了 ' + count + ' 条记忆、' + (response.headers.get('x-aelios-precious') || 0) + ' 条珍贵' : '导出好了');
+      } catch (error) {
+        this.notify('导出失败：' + error.message);
+      }
+      this.transfer.exporting = false;
+    },
+    async copyImportPrompt() {
+      if (!this.transfer.info) return;
+      try {
+        await navigator.clipboard.writeText(this.transfer.info.prompt);
+        this.notify('提示词复制好了');
+      } catch (error) {
+        this.notify('复制不了，手动选中复制吧');
+      }
+    },
+    async loadEntriesFile(event) {
+      const file = event.target.files && event.target.files[0];
+      event.target.value = '';
+      if (!file) return;
+      try {
+        this.transfer.entriesText = await file.text();
+        this.transfer.entriesName = file.name;
+        this.transfer.preview = null;
+        await this.previewEntries();
+      } catch (error) {
+        this.notify('读不了这个文件：' + error.message);
+      }
+    },
+    async previewEntries() {
+      const text = this.transfer.entriesText;
+      if (!text.trim()) return;
+      this.transfer.entriesBusy = true;
+      try {
+        const data = await this.request(this.withNamespace('/v1/import/entries/preview'), {
+          method: 'POST',
+          body: JSON.stringify({ text: text })
+        });
+        this.transfer.preview = data.data || null;
+        if (!this.transfer.info) await this.loadTransferInfo();
+      } catch (error) {
+        this.notify(error.message);
+      }
+      this.transfer.entriesBusy = false;
+      this.icons();
+    },
+    entriesPreviewLabel() {
+      const preview = this.transfer.preview;
+      if (!preview) return '';
+      const formats = { 'aelios-jsonl': 'Aelios 导出的 jsonl', jsonl: 'jsonl', json: 'json', markdown: 'md / 文本' };
+      const self = this;
+      const types = Object.keys(preview.by_type || {}).map(function(key) {
+        return (key === 'precious' ? '珍贵' : key === 'unknown' ? '没写类型' : self.importTypeLabel(key)) + ' ' + preview.by_type[key];
+      }).join('、');
+      return '认出 ' + preview.total + ' 条（' + (formats[preview.format] || preview.format) + '）' + (types ? '：' + types : '')
+        + (preview.dated ? '。' + preview.dated + ' 条带日期' : '。都没带日期')
+        + (preview.with_fact_key ? '，' + preview.with_fact_key + ' 条带 fact_key' : '')
+        + (preview.skipped ? '，跳过 ' + preview.skipped + ' 行' : '') + '。';
+    },
+    async runEntriesImport() {
+      const preview = this.transfer.preview;
+      if (!preview || !preview.entries.length) return;
+      if (!this.transfer.info) await this.loadTransferInfo();
+      const per = (this.transfer.info && this.transfer.info.entries.per_request) || 25;
+      const ns = this.namespace;
+      const mode = this.transfer.entriesMode;
+      const entries = preview.entries;
+      const fingerprint = (await this.sha256(this.transfer.entriesText)).slice(0, 40);
+      this.transfer.entriesRun = { running: true, total: entries.length, done: 0, failed: 0, importId: '', lastError: '', counts: { created: 0, updated: 0, unchanged: 0, duplicate: 0, queued: 0, precious: 0, failed: 0 } };
+      // 改要经过 Alpine 包过的那一份，页面才会跟着变。
+      const run = this.transfer.entriesRun;
+      this.transfer.entriesBusy = true;
+      for (let index = 0; index < entries.length; index += per) {
+        const slice = entries.slice(index, index + per);
+        try {
+          const data = await this.request(this.nsPath('/v1/import/entries', ns), {
+            method: 'POST',
+            body: JSON.stringify({ namespace: ns, fingerprint: fingerprint, name: this.transfer.entriesName || '粘贴的文字', mode: mode, start_index: index, total: entries.length, entries: slice })
+          });
+          const result = data.data || {};
+          run.importId = result.import_id || run.importId;
+          Object.keys(run.counts).forEach(function(key) { run.counts[key] += (result.counts && result.counts[key]) || 0; });
+        } catch (error) {
+          run.counts.failed += slice.length;
+          run.lastError = error.message;
+        }
+        run.done = Math.min(index + per, entries.length);
+      }
+      run.running = false;
+      this.transfer.entriesBusy = false;
+      if (ns === this.namespace) await Promise.all([this.loadImportBatches(), this.loadBoot(), this.loadMemories()]);
+      this.notify(run.counts.failed ? '导完了，有 ' + run.counts.failed + ' 条没成功' : '导完了');
+    },
+    entriesRunLabel() {
+      const run = this.transfer.entriesRun;
+      if (!run) return '';
+      const c = run.counts;
+      const parts = [];
+      if (c.created) parts.push('新建 ' + c.created);
+      if (c.updated) parts.push('改写 ' + c.updated + '（旧版留着）');
+      if (c.unchanged) parts.push('没变 ' + c.unchanged);
+      if (c.duplicate) parts.push('库里已有、跳过 ' + c.duplicate);
+      if (c.queued) parts.push('进审核 ' + c.queued);
+      if (c.precious) parts.push('珍贵 ' + c.precious);
+      if (c.failed) parts.push('失败 ' + c.failed + (run.lastError ? '（' + run.lastError + '）' : ''));
+      return (run.running ? '在导入 ' : '导完了 ') + run.done + ' / ' + run.total + (parts.length ? '：' + parts.join('，') : '');
+    },
+    async loadChatFile(event) {
+      const file = event.target.files && event.target.files[0];
+      event.target.value = '';
+      if (!file) return;
+      if (this.transfer.chatRun && this.transfer.chatRun.running) {
+        this.notify('先暂停现在这份');
+        return;
+      }
+      if (!window.AeliosChat) {
+        this.notify('页面没加载完整，刷新一下再试');
+        return;
+      }
+      this.transfer.chatLoading = true;
+      this.transfer.chat = null;
+      this.transfer.chatRun = null;
+      chatParsed = null;
+      chatChunks = [];
+      try {
+        if (!this.transfer.info) await this.loadTransferInfo();
+        const text = await file.text();
+        const parsed = window.AeliosChat.parseChatExport(text, file.name);
+        if (!parsed.messages.length) throw new Error('没认出消息。' + (parsed.warnings[0] || ''));
+        chatParsed = parsed;
+        const me = this.transfer.info && this.transfer.info.speakers ? this.transfer.info.speakers.user : '';
+        const needsRoles = parsed.speakers.some(function(speaker) { return speaker.role === null; });
+        this.transfer.chat = {
+          name: file.name,
+          hash: await this.sha256(text),
+          format: parsed.format,
+          conversations: parsed.conversations,
+          messageCount: parsed.messages.length,
+          skipped: parsed.skipped,
+          warnings: parsed.warnings,
+          needsRoles: needsRoles,
+          speakers: parsed.speakers.map(function(speaker) {
+            return { name: speaker.name, count: speaker.count, role: speaker.role, isUser: speaker.role === 'user' || (speaker.role === null && !!me && speaker.name === me) };
+          }),
+          chunks: 0, chars: 0, firstDate: '', lastDate: '', estimateIn: 0, estimateOut: 0, rolesKey: ''
+        };
+        this.rechunkChat();
+      } catch (error) {
+        this.notify('读不了这个文件：' + error.message);
+      }
+      this.transfer.chatLoading = false;
+      this.icons();
+    },
+    chatTimeZone() {
+      if (this.transfer.info && this.transfer.info.time_zone) return this.transfer.info.time_zone;
+      try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (error) { return 'UTC'; }
+    },
+    rechunkChat() {
+      const chat = this.transfer.chat;
+      if (!chat || !chatParsed) return;
+      const users = chat.speakers.filter(function(speaker) { return speaker.isUser; }).map(function(speaker) { return speaker.name; });
+      const messages = chat.needsRoles ? window.AeliosChat.chatApplyRoles(chatParsed.messages, users) : chatParsed.messages;
+      const limits = (this.transfer.info && this.transfer.info.chunk) || { default_messages: 60, default_chars: 30000 };
+      chatChunks = window.AeliosChat.chatChunkByDay(messages, { timeZone: this.chatTimeZone(), maxMessages: limits.default_messages, maxChars: limits.default_chars });
+      const days = chatChunks.map(function(chunk) { return chunk.day; }).filter(Boolean).sort();
+      chat.chunks = chatChunks.length;
+      chat.chars = chatChunks.reduce(function(sum, chunk) { return sum + chunk.chars; }, 0);
+      chat.firstDate = days[0] || '';
+      chat.lastDate = days[days.length - 1] || '';
+      chat.estimateIn = Math.ceil(chat.chars * 1.1) + chat.chunks * 2500;
+      chat.estimateOut = chat.chunks * 300;
+      chat.rolesKey = users.slice().sort().join('|');
+      if (this.transfer.chatRun && !this.transfer.chatRun.running) this.transfer.chatRun = null;
+    },
+    chatSummaryLabel() {
+      const chat = this.transfer.chat;
+      if (!chat) return '';
+      const formats = { chatgpt: 'ChatGPT 导出', claude: 'Claude 导出', sillytavern: '酒馆聊天', json: 'JSON', jsonl: 'JSONL', text: '文本' };
+      const model = this.transfer.info ? this.transfer.info.model : '';
+      return (formats[chat.format] || chat.format) + '，' + (chat.conversations > 1 ? chat.conversations + ' 段对话，' : '') + chat.messageCount + ' 条消息'
+        + (chat.firstDate ? '，' + chat.firstDate + (chat.lastDate !== chat.firstDate ? ' 到 ' + chat.lastDate : '') : '，没认出日期')
+        + '。切成 ' + chat.chunks + ' 段，共 ' + chat.chars + ' 字。估计模型要读约 ' + this.fmtTokens(chat.estimateIn) + ' token、写约 ' + this.fmtTokens(chat.estimateOut) + ' token'
+        + (model ? '（' + model + '）' : '') + '。';
+    },
+    async runChatImport() {
+      const chat = this.transfer.chat;
+      if (!chat || !chatChunks.length) return;
+      if (chat.needsRoles && !chat.speakers.some(function(speaker) { return speaker.isUser; })) {
+        this.notify('先勾上哪个名字是你');
+        return;
+      }
+      if (!this.transfer.info) await this.loadTransferInfo();
+      const ns = this.namespace;
+      const limits = (this.transfer.info && this.transfer.info.chunk) || { default_messages: 60, default_chars: 30000 };
+      const fingerprint = (await this.sha256([chat.hash, chat.rolesKey, limits.default_messages, limits.default_chars, this.chatTimeZone()].join('|'))).slice(0, 40);
+      this.transfer.chatRun = { running: true, stop: false, namespace: ns, importId: '', total: chatChunks.length, done: 0, candidates: 0, merged: 0, duplicates: 0, modelCalls: 0, tokensIn: 0, tokensOut: 0, estimated: false, clefCalls: 0, errors: 0, lastError: '', current: '' };
+      const run = this.transfer.chatRun;
+      const applyBatch = function(batch) {
+        if (!batch) return;
+        run.done = batch.done_chunks || 0;
+        run.candidates = batch.candidates || 0;
+        run.modelCalls = batch.model_calls || 0;
+        run.tokensIn = batch.tokens_in || 0;
+        run.tokensOut = batch.tokens_out || 0;
+        run.clefCalls = batch.clef_calls || 0;
+      };
+      try {
+        const start = await this.request(this.nsPath('/v1/import/batches', ns), {
+          method: 'POST',
+          body: JSON.stringify({ namespace: ns, fingerprint: fingerprint, name: chat.name, total_chunks: chatChunks.length, total_messages: chat.messageCount, total_chars: chat.chars, first_date: chat.firstDate || null, last_date: chat.lastDate || null })
+        });
+        const batch = start.data.batch;
+        run.importId = batch.id;
+        applyBatch(batch);
+        const done = new Set(start.data.done_keys || []);
+        const chunks = chatChunks;
+        let streak = 0;
+        for (const chunk of chunks) {
+          if (run.stop) break;
+          if (done.has(chunk.key)) continue;
+          run.current = chunk.key;
+          try {
+            const data = await this.request(this.nsPath('/v1/import/chat/chunk', ns), {
+              method: 'POST',
+              body: JSON.stringify({ namespace: ns, import_id: batch.id, chunk: { key: chunk.key, day: chunk.day, messages: chunk.messages }, clef: !!this.transfer.chatClef })
+            });
+            const result = data.data.result;
+            if (result.status === 'error') {
+              run.errors += 1;
+              run.lastError = chunk.key + '：' + (result.error || '出错了');
+              streak += 1;
+            } else {
+              streak = 0;
+              done.add(chunk.key);
+            }
+            run.merged += result.merged || 0;
+            run.duplicates += result.duplicates || 0;
+            run.estimated = run.estimated || !!result.tokens_estimated;
+            applyBatch(data.data.batch);
+          } catch (error) {
+            run.errors += 1;
+            run.lastError = chunk.key + '：' + error.message;
+            streak += 1;
+          }
+          if (streak >= 3) {
+            run.lastError += '（连着 3 段出错，先停下了）';
+            break;
+          }
+        }
+      } catch (error) {
+        run.lastError = error.message;
+      }
+      run.running = false;
+      run.stop = false;
+      run.current = '';
+      if (ns === this.namespace) await Promise.all([this.loadImportBatches(), this.loadBoot()]);
+      this.icons();
+    },
+    chatRunPercent() {
+      const run = this.transfer.chatRun;
+      return run && run.total ? Math.round(run.done / run.total * 100) : 0;
+    },
+    chatRunLabel() {
+      const run = this.transfer.chatRun;
+      if (!run) return '';
+      const head = run.running ? '在做 ' + (run.current || '…') + '。' : (run.done >= run.total ? '做完了。' : '停在这里了。');
+      return head + '已做 ' + run.done + ' / ' + run.total + ' 段，' + run.candidates + ' 条候选进了审核'
+        + (run.merged ? '（另有 ' + run.merged + ' 次说到同一件事，并进了已有候选）' : '')
+        + (run.duplicates ? '，' + run.duplicates + ' 条跟库里一字不差、跳过' : '')
+        + '。模型 ' + run.modelCalls + ' 次，' + this.fmtTokens(run.tokensIn) + ' 进 / ' + this.fmtTokens(run.tokensOut) + ' 出 token'
+        + (run.estimated ? '（有的段模型没回用量，按字数估的）' : '')
+        + (run.clefCalls ? '，clef ' + run.clefCalls + ' 次' : '')
+        + (run.errors ? '，出错 ' + run.errors + ' 段' : '') + '。';
+    },
+    async toggleMemoryRevisions(memory) {
+      memory.revOpen = !memory.revOpen;
+      if (!memory.revOpen) return;
+      memory.revisions = null;
+      try {
+        const data = await this.request(this.withNamespace('/v1/memories/' + encodeURIComponent(memory.id) + '/revisions'));
+        memory.revisions = data.data || [];
+      } catch (error) {
+        memory.revisions = [];
+        this.notify(error.message);
+      }
+    },
+    revisionReasonLabel(rev) {
+      const reason = { fact_key_upsert: '同一个 key 再写一遍时被改', edit: '手动改的', candidate_merge: '审核合并时被改' }[rev.reason] || rev.reason || '';
+      return reason + (rev.replaced_by ? '（改它的：' + rev.replaced_by + '）' : '');
+    },
+    async restoreMemoryRevision(memory, rev) {
+      if (!window.confirm('把这条记忆恢复成这一版？现在这版会存进旧版里。')) return;
+      try {
+        await this.request(this.withNamespace('/v1/memory/' + encodeURIComponent(memory.id)), {
+          method: 'PATCH',
+          body: JSON.stringify({
+            namespace: this.namespace,
+            type: rev.type || memory.type,
+            content: rev.content,
+            confidence: memory.confidence,
+            importance: memory.importance,
+            tags: (rev.tags && rev.tags.length) ? rev.tags : (memory.tags || []),
+            source: 'restore'
+          })
+        });
+        await this.loadMemories();
+        this.notify('恢复好了');
+      } catch (error) {
+        this.notify(error.message);
+      }
     },
     get pendingCount() {
       if (this.stats && typeof this.stats.pending_candidates === 'number') return this.stats.pending_candidates;

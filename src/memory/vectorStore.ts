@@ -5,7 +5,7 @@ import { nowIso } from "../utils/time";
 import { createEmbedding } from "./embedding";
 import { deleteFtsRow, upsertMemoryFts } from "./fts";
 import { clampMemoryType } from "./canonicalTypes";
-import { deleteTriggersForMemory } from "../db/v2";
+import { deleteTriggersForMemory, saveMemoryRevision } from "../db/v2";
 import { deleteTriggerVectors } from "./triggers/store";
 
 type MetadataMap = Record<string, unknown>;
@@ -511,6 +511,15 @@ export async function updateVectorMemory(
     expires_at: next.expiresAt
   };
 
+  if (!contentUnchanged) {
+    await saveMemoryRevision(env.DB, {
+      namespace: existing.namespace,
+      memoryId: existing.id,
+      nextContent: content,
+      replacedBy: patch.source ?? null,
+      reason: "edit"
+    });
+  }
   const updatedRecord = await updateMemoryRecord(env, nextRecord);
   if (!updatedRecord) return null;
 
