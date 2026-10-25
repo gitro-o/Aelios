@@ -25,6 +25,11 @@ const SETTING_ROW = String.raw`<div class="border-t border-zinc-800 py-3" :title
                 </template>
               </div>`;
 const CHEVRON = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`;
+const SVG_OPEN = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">';
+const ICON_PLUS = SVG_OPEN + '<path d="M12 5v14M5 12h14"/></svg>';
+const ICON_MINUS = SVG_OPEN + '<path d="M5 12h14"/></svg>';
+const ICON_LINK = SVG_OPEN + '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>';
+const ICON_SPIN = SVG_OPEN + '<path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>';
 
 // 导入聊天记录时在浏览器里拆文件、按天切段的那几个函数 (跟服务端是同一份代码)。
 const CHAT_PARSE_SCRIPT = chatParseBrowserScript();
@@ -236,10 +241,15 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
   .switch:disabled { opacity: .6; }
   .chev { display: inline-grid; place-items: center; flex-shrink: 0; color: var(--text-4); transition: transform .15s ease; }
   .chev.is-open { transform: rotate(180deg); }
+  /* 清单里一行末尾的小圆按钮：加、减、测连通。 */
+  .icon-btn { display: inline-grid; place-items: center; flex-shrink: 0; width: 2rem; height: 2rem; border-radius: 999px; color: var(--text-4); transition: color .15s ease, background-color .15s ease; }
+  .icon-btn:hover:not(:disabled) { color: var(--coral); background: var(--hover-bg); }
+  .icon-btn:disabled { opacity: .5; cursor: default; }
   .savebar { border-color: var(--coral) !important; background: var(--panel-bg-strong); box-shadow: var(--panel-glow); backdrop-filter: blur(12px); }
 
   /* ===== 梦境观测台 ===== */
-  .dream-stat { position: relative; }
+  /* overflow 裁剪：顶部的极光条是直的，不裁的话会从圆角卡片的左右两侧探出去 */
+  .dream-stat { position: relative; overflow: hidden; }
   .dream-stat::before {
     content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
     border-radius: 2px; background: var(--aurora); opacity: .75;
@@ -1038,7 +1048,10 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
               <h3 class="text-base font-semibold text-zinc-100" x-text="entry.title"></h3>
               <p class="mt-1 text-xs text-zinc-500" x-show="entry.source_message_ids && entry.source_message_ids.length" x-text="entry.sources_kept == null ? entry.source_message_ids.length + ' 条原文' : entry.sources_kept ? entry.sources_kept + ' 条原文还在，可溯源' : '原文已过保留期清理，只剩这篇日记'"></p>
               <p class="mt-2 whitespace-pre-wrap text-sm leading-7 text-zinc-300" :class="isDiaryExpanded('daily:' + entry.date) ? '' : 'line-clamp-4'" x-text="entry.summary"></p>
-              <button type="button" @click="toggleDiaryExpand('daily:' + entry.date)" class="tap mt-2 text-xs text-coral transition duration-150 ease-in-out hover:underline" x-text="isDiaryExpanded('daily:' + entry.date) ? '收起' : '展开全文'"></button>
+              <div class="mt-2 flex flex-wrap items-center gap-4">
+                <button type="button" @click="toggleDiaryExpand('daily:' + entry.date)" class="tap text-xs text-coral transition duration-150 ease-in-out hover:underline" x-text="isDiaryExpanded('daily:' + entry.date) ? '收起' : '展开全文'"></button>
+                <button type="button" x-show="entry.sources_kept !== 0" @click="rewriteDiary(entry)" :disabled="diaryRewriting !== ''" class="tap text-xs text-zinc-400 transition duration-150 ease-in-out hover:text-coral disabled:opacity-50" x-text="diaryRewriting === entry.date ? '重写中，请保持页面打开…' : '用原文重写这篇'"></button>
+              </div>
             </article>
           </template>
         </div>
@@ -1095,7 +1108,7 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
 
         <article class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
           <h2 class="text-base font-semibold">现在做梦</h2>
-          <p class="mt-1 text-xs text-zinc-400">预演只看不落库；关掉预演才是真跑。force 会重做已经梦过的夜晚。</p>
+          <p class="mt-1 text-xs text-zinc-400">预演只看不落库；预演需保持页面打开。关掉预演才是真跑，确认入队后可关页。force 会重做已经梦过的夜晚。</p>
           <div class="mt-3 grid gap-3 md:grid-cols-[170px_1fr_1fr_auto]">
             <input type="date" x-model="dreamDate" class="h-11 rounded-2xl border border-zinc-800 bg-[#0a0a0b] px-3 text-sm text-zinc-100 outline-none transition duration-150 ease-in-out focus:border-coral">
             <label class="tap flex items-center gap-2 rounded-2xl border border-zinc-800 px-3 text-sm text-zinc-300">
@@ -1104,12 +1117,23 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
             <label class="tap flex items-center gap-2 rounded-2xl border border-zinc-800 px-3 text-sm text-zinc-300">
               <input type="checkbox" x-model="dreamForce" class="h-4 w-4 shrink-0 accent-[#ff7a66]"><span>force 重跑</span>
             </label>
-            <button type="button" @click="triggerDream()" :disabled="dreamTriggering" class="tap inline-flex items-center justify-center gap-2 rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 transition duration-150 ease-in-out disabled:opacity-50">
-              <i data-lucide="moon-star" class="h-4 w-4"></i><span x-text="dreamTriggering ? '做梦中…' : '现在做梦'"></span>
+            <button type="button" @click="triggerDream()" :disabled="dreamTriggering || (!dreamDryRun && dreamActiveRun)" class="tap inline-flex items-center justify-center gap-2 rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 transition duration-150 ease-in-out disabled:opacity-50">
+              <i data-lucide="moon-star" class="h-4 w-4"></i><span x-text="dreamTriggering ? (dreamDryRun ? '预演中，请保持页面打开…' : '提交中…') : '现在做梦'"></span>
             </button>
           </div>
 
+          <p x-show="dreamStatusError" class="mt-3 text-xs text-amber-400" x-text="dreamStatusError"></p>
+          <div x-show="dreamActiveRun" class="mt-4 rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3 text-sm text-zinc-300">
+            <div x-text="dreamActiveRun && ('任务 ' + dreamActiveRun.id + ' · ' + dreamStatusLabel(dreamActiveRun.status, dreamActiveRun.stale))"></div>
+            <p class="mt-1 text-xs text-amber-400" x-show="dreamActiveRun && dreamActiveRun.stale">任务可能已中断，完成状态未确认。不会自动重跑；force 也不能覆盖，请先核查。</p>
+            <button type="button" x-show="dreamActiveRun && dreamActiveRun.stale" @click="resolveDreamRun()" :disabled="dreamResolving" class="tap mt-3 inline-flex items-center justify-center rounded-2xl border border-amber-500/60 px-3 text-xs font-semibold text-amber-400 transition duration-150 ease-in-out disabled:opacity-50">
+              <span x-text="dreamResolving ? '标记中…' : '核查后标记为已中断'"></span>
+            </button>
+          </div>
           <div x-show="dreamRunResult" class="mt-4 space-y-3">
+            <template x-if="dreamRunResult && dreamRunResult.run_id">
+              <div class="rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3 text-xs text-zinc-300" x-text="'任务 ' + dreamRunResult.run_id + ' · ' + dreamStatusLabel(dreamRunResult.status, dreamRunResult.stale)"></div>
+            </template>
             <template x-if="dreamRunResult && dreamRunResult.result && !dreamRunResult.result.ran">
               <div class="rounded-2xl border border-zinc-800 bg-[#0a0a0b] p-3 text-sm text-zinc-300" x-text="'这一夜没有做梦：' + dreamReasonLabel(dreamRunResult.result.reason)"></div>
             </template>
@@ -1192,13 +1216,13 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
           </template>
           <div class="dream-rail space-y-3">
             <template x-for="run in dreamRuns" :key="run.id">
-              <article class="dream-rail-item" :class="dreamRailClass(run.status)">
+              <article class="dream-rail-item" :class="dreamRailClass(run.stale ? 'stale' : run.status)">
                 <div class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 shadow-sm">
                   <div class="mb-2 flex flex-wrap items-center gap-2">
                     <span class="text-sm font-semibold text-zinc-100" x-text="run.date_label"></span>
                     <span class="chip" :class="dreamStatusChipClass(run.status)">
-                      <span x-show="run.status === 'running'" class="breathe inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
-                      <span x-text="dreamStatusLabel(run.status)"></span>
+                      <span x-show="run.status === 'running' && !run.stale" class="breathe inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
+                      <span x-text="dreamStatusLabel(run.status, run.stale)"></span>
                     </span>
                     <span class="chip chip-dim" x-text="dreamTriggerLabel(run.trigger)"></span>
                     <span class="ml-auto text-xs text-zinc-400" x-text="dreamDuration(run)"></span>
@@ -1414,6 +1438,130 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
           </div>
         </article>
 
+        <article x-show="savedApiKey.trim() && !gwQuery.trim()" class="rounded-2xl border border-zinc-800 bg-zinc-900 shadow-sm">
+          <button type="button" @click="gwToggle('供应商')" :aria-expanded="gwIsOpen('供应商') ? 'true' : 'false'" class="tap flex w-full items-center justify-between gap-3 px-4 py-3 text-left">
+            <span class="min-w-0">
+              <span class="block text-sm font-semibold text-zinc-100">供应商</span>
+              <span class="block truncate text-[11px] text-zinc-500" x-text="providersSummary()"></span>
+            </span>
+            <span class="chev" :class="gwIsOpen('供应商') ? 'is-open' : ''">${CHEVRON}</span>
+          </button>
+          <div x-show="gwIsOpen('供应商')" class="border-t border-zinc-800 p-4">
+            <section>
+          <div class="flex items-start justify-between gap-3">
+            <div class="min-w-0">
+              <h3 class="text-sm font-semibold text-zinc-100">ChatGPT 套餐</h3>
+              <p class="mt-0.5 text-[11px] leading-5 text-zinc-500">用你自己的 ChatGPT 套餐额度跑 <span class="font-mono">chatgpt/模型名</span>，不走 AI Gateway。只连你自己的账号，别把这条线路分给别人。</p>
+            </div>
+            <span class="chip shrink-0" :class="chatgptChipClass()" x-text="chatgptChipText()"></span>
+          </div>
+          <p x-show="chatgpt.error" class="mt-2 text-xs text-coral" x-text="chatgpt.error"></p>
+
+          <div x-show="chatgpt.status && chatgpt.status.status === 'connected'" class="mt-3 rounded-xl border border-zinc-800 bg-[#0a0a0b] px-3 py-2">
+            <p class="text-sm text-zinc-100">Using ChatGPT plan<span class="text-zinc-500" x-text="chatgpt.status && chatgpt.status.email ? ' · ' + chatgpt.status.email : ''"></span></p>
+            <p class="mt-1 text-[11px] leading-5 text-zinc-500">客户端的模型名写 <span class="font-mono">chatgpt/…</span>（下面「测试」会列出可用的）。想让它带上记忆，把 <span class="font-mono">chatgpt/*</span> 加进助手的主模型。用量计入你的 ChatGPT 套餐。<a href="https://chatgpt.com/#settings/Usage" target="_blank" rel="noopener" class="ml-1 underline hover:text-coral">Manage usage</a></p>
+          </div>
+          <div x-show="chatgpt.status && chatgpt.status.status === 'plan_disabled'" class="mt-3 rounded-xl border border-zinc-800 bg-[#0a0a0b] px-3 py-2">
+            <p class="text-xs leading-5 text-zinc-400">已登录 ChatGPT，但没有授权 Aelios 使用套餐额度，所以不会发任何请求。点下面「重新授权」，在同意页里允许使用套餐。</p>
+          </div>
+          <div x-show="chatgpt.status && chatgpt.status.status === 'needs_login'" class="mt-3 rounded-xl border border-zinc-800 bg-[#0a0a0b] px-3 py-2">
+            <p class="text-xs leading-5 text-zinc-400">ChatGPT 的登录失效了（可能在 ChatGPT 设置里断开过，或很久没用）。重新登录一次就行。</p>
+            <p x-show="chatgpt.status && chatgpt.status.last_error" class="mt-1 text-[11px] text-zinc-500" x-text="chatgpt.status && chatgpt.status.last_error"></p>
+          </div>
+
+          <div class="mt-3 flex flex-wrap items-center gap-2">
+            <button type="button" @click="chatgptLogin({})" :disabled="chatgpt.busy" x-show="!chatgpt.status || ['disconnected','needs_login'].includes(chatgpt.status.status)" class="tap inline-flex items-center gap-2 rounded-2xl border border-zinc-700 bg-black px-4 text-sm font-semibold text-white transition hover:border-coral disabled:opacity-50">Continue with ChatGPT</button>
+            <button type="button" @click="chatgptLogin({ reconsent: true })" :disabled="chatgpt.busy" x-show="chatgpt.status && chatgpt.status.status === 'plan_disabled'" class="tap rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 disabled:opacity-50">重新授权</button>
+            <button type="button" @click="chatgptTest()" :disabled="chatgpt.busy" x-show="chatgpt.status && chatgpt.status.status === 'connected'" class="tap rounded-2xl border border-zinc-800 px-3 text-xs text-zinc-300 transition hover:border-coral hover:text-zinc-100 disabled:opacity-50" x-text="chatgpt.testing ? '测试中…' : '测试'"></button>
+            <button type="button" @click="chatgptLogin({ account: 'new' })" :disabled="chatgpt.busy" x-show="chatgpt.status && chatgpt.status.registered" class="tap rounded-2xl border border-zinc-800 px-3 text-xs text-zinc-500 transition hover:border-coral hover:text-zinc-100 disabled:opacity-50" title="换账号，或者保存的登记被拒绝时重新登记一次">换一个 ChatGPT 账号</button>
+            <button type="button" @click="chatgptLogout()" :disabled="chatgpt.busy" x-show="chatgpt.status && ['connected','plan_disabled','needs_login'].includes(chatgpt.status.status)" class="tap rounded-2xl border border-zinc-800 px-3 text-xs text-zinc-500 transition hover:border-coral hover:text-zinc-100 disabled:opacity-50">退出登录</button>
+          </div>
+
+          <div x-show="chatgpt.authorizeUrl" class="mt-3 rounded-xl border border-zinc-800 bg-[#0a0a0b] p-3">
+            <p class="text-xs leading-5 text-zinc-300">① 在新打开的页面里登录 ChatGPT 并同意。没弹出来的话 <a :href="chatgpt.authorizeUrl" target="_blank" rel="noopener" class="underline hover:text-coral">点这里打开</a>。</p>
+            <p class="mt-1 text-xs leading-5 text-zinc-300">② 同意之后浏览器会跳到一个打不开的页面（<span class="font-mono">127.0.0.1</span>，提示无法连接），<b>这是正常的，别关</b>。把地址栏里那一整条地址复制下来，贴在下面。</p>
+            <textarea x-model="chatgpt.pasted" rows="3" aria-label="粘贴浏览器地址栏里的完整地址" placeholder="http://127.0.0.1:1455/auth/callback?code=…&amp;state=…" class="mt-2 w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 font-mono text-xs text-zinc-100 outline-none focus:border-coral"></textarea>
+            <p class="mt-1 text-[11px] leading-5 text-zinc-500">如果你电脑上正开着 Codex CLI 之类也在用 1455 端口的程序，它会抢走这个回跳，先关掉再登。链接 10 分钟内有效。</p>
+            <div class="mt-2 flex items-center gap-2">
+              <button type="button" @click="chatgptFinish()" :disabled="chatgpt.busy" class="tap rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 disabled:opacity-50">完成登录</button>
+              <button type="button" @click="chatgpt.authorizeUrl = ''; chatgpt.pasted = ''; chatgpt.error = ''" class="tap rounded-2xl border border-zinc-800 px-3 text-xs text-zinc-500 transition hover:border-coral hover:text-zinc-100">取消</button>
+            </div>
+          </div>
+
+          <div x-show="chatgpt.test" class="mt-3 rounded-xl border border-zinc-800 bg-[#0a0a0b] px-3 py-2">
+            <template x-if="chatgpt.test && chatgpt.test.ok">
+              <div>
+                <p class="text-xs text-zinc-100">通了：<span class="font-mono" x-text="'chatgpt/' + chatgpt.test.model"></span>，<span x-text="chatgpt.test.latency_ms + ' 毫秒'"></span>，回复「<span x-text="chatgpt.test.reply"></span>」</p>
+                <p class="mt-1 text-[11px] leading-5 text-zinc-500">这个账号能用的模型：</p>
+                <ul class="mt-1 space-y-0.5">
+                  <template x-for="m in (chatgpt.test.models || [])" :key="m.slug"><li class="font-mono text-[11px] text-zinc-400" x-text="'chatgpt/' + m.slug + (m.name && m.name !== m.slug ? '（' + m.name + '）' : '')"></li></template>
+                </ul>
+              </div>
+            </template>
+            <template x-if="chatgpt.test && !chatgpt.test.ok">
+              <div>
+                <p class="text-xs text-coral" x-text="'没通（' + chatgpt.test.step + (chatgpt.test.status ? ' · ' + chatgpt.test.status : '') + '）：' + chatgpt.test.error"></p>
+                <p x-show="chatgpt.test.status === 403" class="mt-1 text-[11px] leading-5 text-zinc-500">403 也可能是地区限制：Worker 是从哪个 Cloudflare 机房出去的，OpenAI 就按那里的地区判断。</p>
+              </div>
+            </template>
+          </div>
+            </section>
+            <section class="mt-4 border-t border-zinc-800 pt-4">
+          <div class="flex items-start justify-between gap-3">
+            <div class="min-w-0">
+              <h3 class="text-sm font-semibold text-zinc-100">模型清单</h3>
+              <p class="mt-0.5 text-[11px] leading-5 text-zinc-500">客户端的模型下拉只显示这里选的，上游几千个模型不再全倒出去。只管显示：清单外的模型照样能调用，能手填的客户端直接手填就行。留空则显示上游目录里的全部。</p>
+            </div>
+            <span class="chip shrink-0" :class="modelList.items.length ? 'chip-ok' : ''" x-text="!modelList.loaded ? '读取中' : modelList.items.length ? '显示 ' + modelList.items.length + ' 个' : '显示全部'"></span>
+          </div>
+          <p x-show="modelList.error" class="mt-2 text-xs text-coral" x-text="modelList.error"></p>
+
+          <ul x-show="modelList.items.length" class="mt-3 rounded-xl border border-zinc-800 bg-[#0a0a0b]">
+            <template x-for="(id, index) in modelList.items" :key="id">
+              <li :class="index ? 'border-t border-zinc-800' : ''" class="px-3 py-1.5">
+                <div class="flex items-center gap-1">
+                  <span class="min-w-0 flex-1 break-all font-mono text-[11px] text-zinc-300" x-text="id"></span>
+                  <button type="button" @click="modelListCheck(id)" :disabled="modelListState(id) === 'testing'" :aria-label="'测试连通性 ' + id" :title="modelListCheckTitle(id)" class="icon-btn">
+                    <span x-show="modelListState(id) === 'ok'" class="h-2 w-2 rounded-full" style="background: var(--ok)"></span>
+                    <span x-show="modelListState(id) === 'testing'" class="animate-spin">${ICON_SPIN}</span>
+                    <span x-show="modelListState(id) === 'fail'" style="color: var(--err)">${ICON_LINK}</span>
+                    <span x-show="!modelListState(id)">${ICON_LINK}</span>
+                  </button>
+                  <button type="button" @click="modelListRemove(id)" :disabled="modelList.busy" :aria-label="'移除 ' + id" title="移除" class="icon-btn">${ICON_MINUS}</button>
+                </div>
+                <p x-show="modelListState(id) === 'fail'" class="mt-1 break-words text-[11px] leading-4 text-coral" x-text="modelList.checks[id] && modelList.checks[id].error"></p>
+              </li>
+            </template>
+          </ul>
+
+          <div class="mt-3 flex gap-2">
+            <input x-model="modelList.typed" @keydown.enter.prevent="modelListAddTyped()" aria-label="手填模型名" placeholder="手填模型名，如 openrouter/openai/gpt-6.1-sol:floor" class="h-10 min-w-0 flex-1 rounded-xl border border-zinc-800 bg-[#0a0a0b] px-3 font-mono text-xs text-zinc-100 outline-none transition focus:border-coral">
+            <button type="button" @click="modelListAddTyped()" :disabled="modelList.busy || !modelList.typed.trim()" class="tap shrink-0 rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950 disabled:opacity-50">添加</button>
+          </div>
+          <p class="mt-1 text-[11px] leading-5 text-zinc-500">自定义 Provider、动态路由、带后缀的写法（如 :floor）上游目录里都没有，这里手填。一次贴好几个也行，用逗号、空格隔开。</p>
+
+          <div class="mt-3 flex flex-wrap items-center gap-2">
+            <button type="button" @click="modelListTogglePicker()" :disabled="modelList.catalogLoading" class="tap rounded-2xl border border-zinc-800 px-3 text-xs text-zinc-300 transition hover:border-coral hover:text-zinc-100 disabled:opacity-50" x-text="modelList.catalogLoading ? '读取中…' : modelList.pickerOpen ? '收起目录' : '从上游目录里选'"></button>
+            <button type="button" x-show="modelList.items.length" @click="modelListClear()" :disabled="modelList.busy" class="tap rounded-2xl border border-zinc-800 px-3 text-xs text-zinc-500 transition hover:border-coral hover:text-zinc-100 disabled:opacity-50">清空，改回显示全部</button>
+          </div>
+
+          <div x-show="modelList.pickerOpen && !modelList.catalogLoading" class="mt-3 rounded-xl border border-zinc-800 bg-[#0a0a0b] p-3">
+            <p x-show="modelList.catalogReason" class="mb-2 text-[11px] leading-5 text-zinc-500" x-text="'上游目录没读到（' + modelList.catalogReason + '）。先检查上游地址和 CF 令牌，或者直接手填。'"></p>
+            <input x-model="modelList.query" @input="modelListSearch()" aria-label="搜索模型" placeholder="搜索，如 claude、gpt-5、openrouter" class="h-10 w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 text-sm text-zinc-100 outline-none transition focus:border-coral">
+            <p class="mt-1 text-[11px] text-zinc-500" x-text="modelList.total + ' 个可选' + (modelList.total > modelList.shown.length ? '，只列前 ' + modelList.shown.length + ' 个，输入关键词缩小范围' : '')"></p>
+            <ul class="mt-2 max-h-72 overflow-y-auto">
+              <template x-for="(id, index) in modelList.shown" :key="id">
+                <li :class="index ? 'border-t border-zinc-800' : ''" class="flex items-center justify-between gap-2 py-1">
+                  <span class="min-w-0 break-all font-mono text-[11px] text-zinc-300" x-text="id"></span>
+                  <button type="button" @click="modelListAdd([id])" :disabled="modelList.busy" :aria-label="'添加 ' + id" title="添加" class="icon-btn text-coral">${ICON_PLUS}</button>
+                </li>
+              </template>
+            </ul>
+          </div>
+            </section>
+          </div>
+        </article>
+
         <article x-show="savedApiKey.trim() && !gwQuery.trim()" class="rounded-2xl border border-zinc-800 bg-zinc-900 px-4 pb-1 pt-4 shadow-sm">
           <h2 class="text-sm font-semibold text-zinc-100">常用</h2>
           <p x-show="gwBusy && !gwGroups.length" class="py-3 text-xs text-zinc-400">读取中…</p>
@@ -1542,6 +1690,15 @@ document.documentElement.dataset.theme = localStorage.getItem('aelios.admin.colo
   </div>
 
   <!-- 查看谁的记忆：平时收成侧栏 / 顶栏里的一行，点开才是完整面板，不再占着每一页的顶上。 -->
+  <!-- 在供应商块外面：块折着时它也要弹出来，而且文章卡片的毛玻璃会把里面的 fixed 困在卡片里、被后面的卡片盖住。 -->
+  <div x-show="chatgpt.welcomeOpen" class="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" role="dialog" aria-modal="true" aria-label="You're using your ChatGPT plan">
+    <div class="w-full max-w-sm rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-xl">
+      <h3 class="text-base font-semibold text-zinc-100">You're using your ChatGPT plan</h3>
+      <p class="mt-2 text-xs leading-5 text-zinc-400">符合条件的请求会用你的 ChatGPT 套餐额度，计入套餐的用量限制。可以在 ChatGPT 设置的 Usage 里管理，或给 Aelios 设每周上限。<a href="https://chatgpt.com/#settings/Usage" target="_blank" rel="noopener" class="ml-1 underline hover:text-coral">Manage usage</a></p>
+      <button type="button" @click="chatgptWelcomed()" class="tap mt-4 w-full rounded-2xl bg-coral px-4 text-sm font-semibold text-zinc-950">Got it</button>
+    </div>
+  </div>
+
   <div x-show="spaceOpen" x-transition.opacity.duration.150ms @keydown.escape.window="spaceOpen = false" class="fixed inset-0 z-50">
     <div class="absolute inset-0 bg-[#0a0a0b]/70" @click="spaceOpen = false"></div>
     <section role="dialog" aria-modal="true" aria-label="选择助手的记忆" class="absolute inset-x-0 bottom-0 max-h-[85dvh] overflow-y-auto rounded-t-2xl border border-zinc-800 bg-zinc-900/95 p-4 pb-[max(16px,env(safe-area-inset-bottom))] shadow-sm md:bottom-auto md:top-16 md:mx-auto md:w-[34rem] md:rounded-2xl md:pb-4">
@@ -1689,6 +1846,7 @@ function memoryAdmin() {
     notebookLoaded: false,
 
     diaryDailies: [],
+    diaryRewriting: '',
     diaryWeeklies: [],
     diaryExpanded: {},
 
@@ -1705,6 +1863,10 @@ function memoryAdmin() {
 
     dreamStatus: null,
     dreamRuns: [],
+    dreamActiveRun: null,
+    dreamPollTimer: null,
+    dreamStatusError: '',
+    dreamResolving: false,
     dreamLoading: false,
     dreamTriggering: false,
     dreamDate: '',
@@ -1721,6 +1883,185 @@ function memoryAdmin() {
     importReview: { batches: [], importId: '', filter: 'all', items: [], counts: { pending: 0, clef_yes: 0, clef_no: 0 }, offset: 0, more: false, loading: false, bulk: null },
     transfer: { info: null, exporting: false, entriesText: '', entriesName: '', preview: null, entriesMode: 'direct', entriesBusy: false, entriesRun: null, chat: null, chatLoading: false, chatClef: true, chatRun: null, batches: [] },
 
+    // 模型清单：只决定 /v1/models 显示什么，不限制能调用什么。改一下存一下，跟设置项一样走同一条队列。
+    modelList: { items: [], loaded: false, busy: false, error: '', typed: '', catalog: [], catalogLoaded: false, catalogLoading: false, catalogReason: '', query: '', pickerOpen: false, shown: [], total: 0, checks: {} },
+    providersSummary() {
+      var list = this.modelList;
+      return 'ChatGPT ' + this.chatgptChipText() + ' · 模型清单 ' + (!list.loaded ? '读取中' : list.items.length ? '显示 ' + list.items.length + ' 个' : '显示全部');
+    },
+    // 连通性：对清单里的一个模型发一条很短的真请求，走和聊天客户端同一条线路。通了变小绿点，没通显示上游的原话。
+    modelListState(id) { return (this.modelList.checks[id] || {}).state || ''; },
+    modelListCheckTitle(id) {
+      var check = this.modelList.checks[id] || {};
+      if (check.state === 'ok') return '通了 · ' + check.ms + ' 毫秒，再点一下重新测';
+      if (check.state === 'testing') return '测试中…';
+      if (check.state === 'fail') return '没通，点一下重试';
+      return '测试连通性（会发一条很短的请求）';
+    },
+    async modelListCheck(id) {
+      if (this.modelListState(id) === 'testing') return;
+      this.modelList.checks[id] = { state: 'testing' };
+      try {
+        var result = await this.request('/api/gateway/models/test', { method: 'POST', body: JSON.stringify({ model: id }) });
+        this.modelList.checks[id] = result.ok
+          ? { state: 'ok', ms: result.latency_ms }
+          : { state: 'fail', error: (result.status ? result.status + ' · ' : '') + (result.error || '没通') };
+      } catch (error) {
+        this.modelList.checks[id] = { state: 'fail', error: error.message };
+      }
+    },
+    modelListSearch() {
+      var list = this.modelList;
+      var query = list.query.trim().toLowerCase();
+      var taken = list.items;
+      var hits = list.catalog.filter(function(id) { return taken.indexOf(id) < 0 && (!query || id.toLowerCase().indexOf(query) >= 0); });
+      list.total = hits.length;
+      list.shown = hits.slice(0, 60);
+    },
+    async modelListTogglePicker() {
+      var list = this.modelList;
+      list.pickerOpen = !list.pickerOpen;
+      if (!list.pickerOpen || list.catalogLoaded) return;
+      list.catalogLoading = true;
+      list.error = '';
+      try {
+        var data = await this.request('/api/gateway/models');
+        list.catalog = (data.chatgpt || []).concat(data.models || []);
+        list.catalogReason = data.reason || '';
+        list.catalogLoaded = true;
+      } catch (error) {
+        list.error = '目录读取失败：' + error.message;
+      }
+      list.catalogLoading = false;
+      this.modelListSearch();
+    },
+    async modelListAddTyped() {
+      var names = this.modelList.typed.split(/[\s,，;；]+/).filter(Boolean);
+      if (!names.length) return;
+      await this.modelListAdd(names);
+      if (!this.modelList.error) this.modelList.typed = '';
+    },
+    modelListAdd(names) {
+      var next = this.modelList.items.slice();
+      names.forEach(function(name) { if (next.indexOf(name) < 0) next.push(name); });
+      return this.modelListSave(next);
+    },
+    modelListRemove(id) {
+      return this.modelListSave(this.modelList.items.filter(function(item) { return item !== id; }));
+    },
+    modelListClear() {
+      if (!window.confirm('清空清单？客户端会改回显示上游目录里的全部模型。清单外的模型本来就能调用，不受影响。')) return;
+      return this.modelListSave([]);
+    },
+    modelListSave(next) {
+      var list = this.modelList;
+      var self = this;
+      if (JSON.stringify(next) === JSON.stringify(list.items)) return Promise.resolve();
+      list.busy = true;
+      list.error = '';
+      var task = async function() {
+        try {
+          var result = await self.request('/api/gateway/config', { method: 'PATCH', body: JSON.stringify({ modelList: next }) });
+          list.items = result.modelList || [];
+          Object.keys(list.checks).forEach(function(name) { if (list.items.indexOf(name) < 0) delete list.checks[name]; });
+          self.notify(list.items.length ? '清单存好了，现在显示 ' + list.items.length + ' 个模型' : '清单已清空，改回显示全部');
+        } catch (error) {
+          list.error = '没存上：' + error.message;
+        }
+        list.busy = false;
+        self.modelListSearch();
+      };
+      var run = settingsQueue.then(task, task);
+      settingsQueue = run.catch(function() {});
+      return run;
+    },
+    chatgpt: { status: null, loaded: false, busy: false, testing: false, error: '', authorizeUrl: '', pasted: '', test: null, welcomeOpen: false },
+    chatgptChipText() {
+      var status = this.chatgpt.status;
+      if (!status) return this.chatgpt.error ? '读取失败' : '读取中';
+      return { connected: '已连接', plan_disabled: '套餐未开通', needs_login: '需重新登录', disconnected: '未连接' }[status.status] || status.status;
+    },
+    chatgptChipClass() {
+      var status = this.chatgpt.status && this.chatgpt.status.status;
+      return status === 'connected' ? 'chip-ok' : status === 'plan_disabled' ? 'chip-warn' : status === 'needs_login' ? 'chip-err' : '';
+    },
+    async chatgptLoad() {
+      if (!this.savedApiKey.trim()) return;
+      try {
+        this.chatgpt.status = await this.request('/api/gateway/chatgpt/status');
+        this.chatgpt.error = '';
+        if (this.chatgpt.status.welcome) this.chatgpt.welcomeOpen = true;
+      } catch (error) {
+        this.chatgpt.error = error.message;
+      }
+      this.chatgpt.loaded = true;
+    },
+    // options: {} 首次或同一个账号；{ reconsent: true } 重新授权套餐；{ account: 'new' } 换账号。
+    async chatgptLogin(options) {
+      this.chatgpt.busy = true;
+      this.chatgpt.error = '';
+      try {
+        var started = await this.request('/api/gateway/chatgpt/login', { method: 'POST', body: JSON.stringify(options || {}) });
+        this.chatgpt.authorizeUrl = started.authorize_url;
+        this.chatgpt.pasted = '';
+        window.open(started.authorize_url, '_blank', 'noopener');
+      } catch (error) {
+        this.chatgpt.error = error.message;
+      }
+      this.chatgpt.busy = false;
+    },
+    async chatgptFinish() {
+      var pasted = this.chatgpt.pasted.trim();
+      if (!pasted) {
+        this.chatgpt.error = '先把浏览器地址栏里的完整地址粘贴进来';
+        return;
+      }
+      this.chatgpt.busy = true;
+      this.chatgpt.error = '';
+      try {
+        await this.request('/api/gateway/chatgpt/callback', { method: 'POST', body: JSON.stringify({ url: pasted }) });
+        this.chatgpt.authorizeUrl = '';
+        this.chatgpt.pasted = '';
+        this.chatgpt.test = null;
+        this.notify('ChatGPT 已连接');
+        await this.chatgptLoad();
+      } catch (error) {
+        this.chatgpt.error = error.message;
+      }
+      this.chatgpt.busy = false;
+    },
+    async chatgptTest() {
+      this.chatgpt.busy = true;
+      this.chatgpt.testing = true;
+      this.chatgpt.error = '';
+      try {
+        this.chatgpt.test = await this.request('/api/gateway/chatgpt/test', { method: 'POST', body: '{}' });
+      } catch (error) {
+        this.chatgpt.error = error.message;
+      }
+      this.chatgpt.testing = false;
+      this.chatgpt.busy = false;
+      await this.chatgptLoad();
+    },
+    async chatgptLogout() {
+      if (!window.confirm('退出 ChatGPT 登录？会去 ChatGPT 那边撤销授权，chatgpt/ 开头的模型会停用。')) return;
+      this.chatgpt.busy = true;
+      this.chatgpt.error = '';
+      try {
+        var result = await this.request('/api/gateway/chatgpt/logout', { method: 'POST', body: '{}' });
+        this.chatgpt.test = null;
+        this.chatgpt.authorizeUrl = '';
+        this.notify(result.revoked === false ? '已退出；ChatGPT 那边的撤销没确认，可以去 ChatGPT 设置里断开' : '已退出 ChatGPT');
+        await this.chatgptLoad();
+      } catch (error) {
+        this.chatgpt.error = error.message;
+      }
+      this.chatgpt.busy = false;
+    },
+    async chatgptWelcomed() {
+      this.chatgpt.welcomeOpen = false;
+      try { await this.request('/api/gateway/chatgpt/welcome', { method: 'POST', body: '{}' }); } catch (error) { /* 下次打开再弹一次，不碍事 */ }
+    },
     async init() {
       this.applyTheme();
       this.icons();
@@ -1969,7 +2310,7 @@ function memoryAdmin() {
       this.todayMessages = []; this.candidates = []; this.judgeDecisions = []; this.memories = [];
       this.precious = []; this.glossary = [];
       this.notebookPages = []; this.notebookDraft = null; this.notebookLoaded = false;
-      this.diaryDailies = []; this.diaryWeeklies = []; this.diaryExpanded = {};
+      this.diaryDailies = []; this.diaryWeeklies = []; this.diaryExpanded = {}; this.diaryRewriting = '';
       this.worldItems = []; this.worldSelection = {}; this.worldQuery = '';
       this.importReview = { batches: [], importId: '', filter: 'all', items: [], counts: { pending: 0, clef_yes: 0, clef_no: 0 }, offset: 0, more: false, loading: false, bulk: null };
       // 正在跑的聊天导入带着自己的空间，换空间不打断它；别的导入状态跟着空间清掉。
@@ -1978,10 +2319,12 @@ function memoryAdmin() {
       this.memoryCreateOpen = false;
       this.memoryDraft = { type: 'fact', content: '', fact_key: '', importance: 0.7, confidence: 0.85 };
       this.glossaryDraft = { term: '', definition: '', aliasesText: '' };
-      this.dreamStatus = null; this.dreamRuns = []; this.dreamHarvest = null;
+      this.stopDreamPolling();
+      this.dreamStatus = null; this.dreamRuns = []; this.dreamActiveRun = null; this.dreamHarvest = null;
       this.dreamExpanded = {}; this.dreamRunResult = null;
       this.dreamDate = ''; this.dreamHarvestDate = '';
       this.dreamLoading = false; this.dreamHarvestLoading = false;
+      this.dreamTriggering = false; this.dreamResolving = false; this.dreamStatusError = '';
       this.debugOutput = '尚未运行维护操作';
     },
     icons() {
@@ -2092,6 +2435,9 @@ function memoryAdmin() {
       try {
         const config = await this.request('/api/gateway/config');
         this.gwAddress = config.upstream && config.upstream.address || '';
+        this.modelList.items = config.modelList || [];
+        this.modelList.loaded = true;
+        this.modelListSearch();
         await this.loadMemoryIdentities();
         this.gwIdentities = (config.identities || []).map(function(idn) {
           return {
@@ -2183,7 +2529,7 @@ function memoryAdmin() {
       this.savePrefs();
       var tasks = [this.loadBoot(), this.loadCandidates(), this.loadMemories(), this.loadSpaces()];
       if (this.page === 'review') tasks.push(this.loadJudgeDecisions());
-      if (this.page === 'settings') tasks.push(this.loadRecallHistory());
+      if (this.page === 'settings') tasks.push(this.loadRecallHistory(), this.chatgptLoad());
       if (this.page === 'diary') tasks.push(this.loadDiary());
       if (this.page === 'more' && this.moreView === 'world') tasks.push(this.loadWorldFacts());
       if (this.page === 'more' && this.moreView === 'notebook') tasks.push(this.loadNotebook());
@@ -2777,13 +3123,14 @@ function memoryAdmin() {
       }
     },
     go(id) {
+      this.stopDreamPolling();
       // 星图 v2 为独立 Three.js 页，从面板跳转而非内嵌 section
       if (id === 'starmap') {
         window.location.href = '/admin/starmap';
         return;
       }
       this.page = id;
-      if (id === 'settings') { this.loadRecallHistory(); if (!this.gwGroups.length && this.savedApiKey.trim()) this.gwLoad(); }
+      if (id === 'settings') { this.loadRecallHistory(); this.chatgptLoad(); if (!this.gwGroups.length && this.savedApiKey.trim()) this.gwLoad(); }
       if (id === 'review') { this.loadCandidates(); this.loadJudgeDecisions(); }
       if (id === 'memory') this.loadMemories();
       if (id === 'diary') this.loadDiary();
@@ -2808,6 +3155,42 @@ function memoryAdmin() {
       }
       this.icons();
     },
+    diaryReasonLabel(reason, error) {
+      const map = {
+        disabled: '日记写手没有开启',
+        no_messages: '这一天没有可用的聊天原文',
+        week_already_rolled_up: '这一周已经汇总成周记，不再重写',
+        ungrounded_sources: '模型给的原文来源对不上，没有写入',
+        model_error: '模型出错',
+        model_invalid_json: '模型返回格式不合要求'
+      };
+      return map[reason] || error || reason || '原因未知';
+    },
+    async rewriteDiary(entry) {
+      if (this.diaryRewriting) return;
+      if (!window.confirm('用 ' + entry.date + ' 的聊天原文重写这篇日记，现在的内容会被覆盖。继续？')) return;
+      const revision = this.spaceRevision;
+      this.diaryRewriting = entry.date;
+      try {
+        const data = await this.request('/admin/diary-rewrite', {
+          method: 'POST',
+          body: JSON.stringify({ namespace: this.namespace, date: entry.date })
+        });
+        if (revision !== this.spaceRevision) return;
+        const stats = (data.data && data.data.stats) || {};
+        if (stats.ran) {
+          this.notify('日记已重写：' + entry.date);
+          await this.loadDiary();
+        } else {
+          this.notify('没有重写：' + this.diaryReasonLabel(stats.reason, stats.error));
+        }
+      } catch (error) {
+        if (revision !== this.spaceRevision) return;
+        this.notify(error.message);
+      } finally {
+        if (revision === this.spaceRevision) this.diaryRewriting = '';
+      }
+    },
     isDiaryExpanded(key) {
       return Boolean(this.diaryExpanded[key]);
     },
@@ -2825,19 +3208,50 @@ function memoryAdmin() {
     dreamAnchorDate() {
       return (this.dreamStatus && this.dreamStatus.anchor_date_label) || this.yesterdayLabel();
     },
+    stopDreamPolling() {
+      if (this.dreamPollTimer != null) window.clearTimeout(this.dreamPollTimer);
+      this.dreamPollTimer = null;
+    },
+    scheduleDreamPolling() {
+      this.stopDreamPolling();
+      if (this.page !== 'dream' || !this.dreamActiveRun || this.dreamActiveRun.stale) return;
+      const revision = this.spaceRevision;
+      this.dreamPollTimer = window.setTimeout(() => {
+        this.dreamPollTimer = null;
+        if (revision === this.spaceRevision && this.page === 'dream') this.loadDreamStatus();
+      }, 5000);
+    },
     async loadDreamStatus() {
       const revision = this.spaceRevision;
+      this.stopDreamPolling();
       this.dreamLoading = true;
+      this.dreamStatusError = '';
       try {
         const data = await this.request(this.withNamespace('/v1/dream/status'));
         if (revision !== this.spaceRevision) return;
         const payload = data.data || {};
         this.dreamStatus = payload;
         this.dreamRuns = payload.dream_runs || [];
+        this.dreamActiveRun = payload.active_run || this.dreamRuns.find(function(run) {
+          return run.status === 'queued' || run.status === 'running';
+        }) || null;
+        const tracked = this.dreamRunResult && this.dreamRunResult.run_id;
+        const run = tracked && (this.dreamRuns.find(function(item) { return item.id === tracked; })
+          || (this.dreamActiveRun && this.dreamActiveRun.id === tracked ? this.dreamActiveRun : null));
+        if (run) {
+          const previousStatus = this.dreamRunResult.status;
+          this.dreamRunResult.status = run.status;
+          this.dreamRunResult.stale = run.stale;
+          if ((previousStatus === 'queued' || previousStatus === 'running') && run.status !== 'queued' && run.status !== 'running') {
+            this.loadDreamHarvest();
+          }
+        }
+        this.scheduleDreamPolling();
         if (!this.dreamDate) this.dreamDate = this.dreamAnchorDate();
         if (!this.dreamHarvestDate) this.dreamHarvestDate = this.dreamAnchorDate();
       } catch (error) {
         if (revision !== this.spaceRevision) return;
+        this.dreamStatusError = '状态读取失败，任务是否完成尚未确认。请刷新核查，不要直接重跑。';
         this.notify(error.message);
       }
       this.dreamLoading = false;
@@ -2863,8 +3277,32 @@ function memoryAdmin() {
       this.loadDreamStatus();
       this.loadDreamHarvest();
     },
+    async resolveDreamRun() {
+      const run = this.dreamActiveRun;
+      if (this.dreamResolving || !run || !run.stale) return;
+      if (!window.confirm('确认任务 ' + run.id + ' 已经不在执行？标记后可以重新发起，但它可能已经写入了部分记忆，建议先查 Worker 日志。')) return;
+      const revision = this.spaceRevision;
+      this.dreamResolving = true;
+      try {
+        await this.request('/v1/dream/resolve', {
+          method: 'POST',
+          body: JSON.stringify({ namespace: this.namespace, run_id: run.id })
+        });
+        if (revision !== this.spaceRevision) return;
+        this.notify('已标记为已中断：' + run.id);
+        await this.loadDreamStatus();
+      } catch (error) {
+        if (revision !== this.spaceRevision) return;
+        this.notify(error.message);
+        await this.loadDreamStatus();
+      } finally {
+        if (revision === this.spaceRevision) this.dreamResolving = false;
+      }
+    },
     async triggerDream() {
-      if (this.dreamTriggering) return;
+      if (this.dreamTriggering || (!this.dreamDryRun && this.dreamActiveRun)) return;
+      const revision = this.spaceRevision;
+      const dryRun = this.dreamDryRun;
       const date = this.dreamDate || this.dreamAnchorDate();
       if (this.dreamForce && !this.dreamDryRun) {
         if (!window.confirm('force + 真跑会重做 ' + date + ' 这一夜的梦境，已经梦过的也会重跑。确认继续？')) return;
@@ -2874,16 +3312,21 @@ function memoryAdmin() {
       try {
         const data = await this.request('/v1/dream/run', {
           method: 'POST',
-          body: JSON.stringify({ namespace: this.namespace, date: date, force: this.dreamForce, dry_run: this.dreamDryRun })
+          body: JSON.stringify({ namespace: this.namespace, date: date, force: this.dreamForce, dry_run: dryRun, background: true })
         });
+        if (revision !== this.spaceRevision) return;
         this.dreamRunResult = data.data || null;
-        if (!this.dreamDryRun) {
+        if (!dryRun) {
           this.dreamHarvestDate = date;
-          await Promise.all([this.loadDreamStatus(), this.loadDreamHarvest()]);
-          this.notify('这一夜梦完了');
+          if (this.dreamRunResult && this.dreamRunResult.run_id) {
+            this.notify('已排队，任务 ' + this.dreamRunResult.run_id);
+          }
+          await this.loadDreamStatus();
         }
       } catch (error) {
+        if (revision !== this.spaceRevision) return;
         this.notify(error.message);
+        if (!dryRun) await this.loadDreamStatus();
       }
       this.dreamTriggering = false;
       this.icons();
@@ -2893,7 +3336,7 @@ function memoryAdmin() {
     },
     dreamLatestLabel() {
       const run = this.dreamLatestRun();
-      return run ? this.dreamStatusLabel(run.status) : '还没有记录';
+      return run ? this.dreamStatusLabel(run.status, run.stale) : '还没有记录';
     },
     dreamLatestSub() {
       const run = this.dreamLatestRun();
@@ -2938,11 +3381,12 @@ function memoryAdmin() {
         };
       });
     },
-    dreamStatusLabel(status) {
-      return { ok: '完成', error: '出错', skipped: '跳过', running: '进行中' }[status] || status || '未知';
+    dreamStatusLabel(status, stale) {
+      if (stale && (status === 'queued' || status === 'running')) return '可能中断 / 状态未确认';
+      return { ok: '完成', error: '出错', skipped: '跳过', queued: '排队中', running: '进行中' }[status] || status || '未知';
     },
     dreamStatusChipClass(status) {
-      return { ok: 'chip-ok', error: 'chip-err', skipped: 'chip-dim', running: 'chip-warn' }[status] || 'chip-dim';
+      return { ok: 'chip-ok', error: 'chip-err', skipped: 'chip-dim', queued: 'chip-warn', running: 'chip-warn' }[status] || 'chip-dim';
     },
     dreamRailClass(status) {
       return { ok: 'dot-ok', error: 'dot-err', skipped: 'dot-dim', running: 'dot-run' }[status] || 'dot-dim';
@@ -2951,7 +3395,8 @@ function memoryAdmin() {
       return { cron: '定时', manual: '手动' }[trigger] || trigger || '—';
     },
     dreamDuration(run) {
-      if (!run.finished_at) return run.status === 'running' ? '进行中' : '—';
+      if (run.stale) return '状态未确认';
+      if (!run.finished_at) return run.status === 'running' ? '进行中' : (run.status === 'queued' ? '等待中' : '—');
       const ms = new Date(run.finished_at).getTime() - new Date(run.started_at).getTime();
       if (!Number.isFinite(ms) || ms < 0) return '—';
       const sec = Math.round(ms / 1000);
@@ -2965,14 +3410,22 @@ function memoryAdmin() {
         dry_run: '只是预演',
         dream_disabled: '梦境未启用',
         model_error: '模型出错',
-        model_invalid_json: '模型返回无法解析',
+        model_timeout: '模型请求超时',
+        model_invalid_json: '模型返回格式不合要求',
         extract_model_error: '抽取模型出错',
+        extract_model_timeout: '抽取模型请求超时',
+        extract_invalid_json: '抽取结果格式不合要求',
+        run_failed: '整理异常退出，请先核查是否部分落库',
+        enqueue_failed: '任务未确认入队',
+        marked_interrupted: '已核查并标记为中断',
+        execution_failed: '后台任务异常退出',
         v2_disabled: 'v2 未启用'
       };
       return map[reason] || reason || '原因未知';
     },
     dreamRunNote(run) {
       const parts = [];
+      if (run.stale) parts.push('超过 20 分钟未确认完成，可能中断；不会自动重跑');
       if (run.reason) parts.push(this.dreamReasonLabel(run.reason));
       if (run.error) {
         let text = run.error;

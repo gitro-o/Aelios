@@ -143,6 +143,18 @@ Under "More → Import / export", each one works on the space you have selected:
 
 One assistant can write to one space and read from several. A fresh conversation can write `coder` while also reading the old vault `coder-old` and a shared `shared-docs`. Leave the recall spaces empty and it only reads its own.
 
+### Dream execution and failure status
+
+The admin Dream console submits non-dry manual Dream runs to the existing durable `MEMORY_QUEUE`. Acceptance returns a run ID immediately; after acceptance, closing the browser does not cancel the queued work. The panel polls status every five seconds and can find the task again after a reload. Queue batches contain one message so several expensive Dream jobs do not share one invocation's execution budget.
+
+API clients opt in with `POST /v1/dream/run` and `{"background":true}` (plus the usual optional namespace, date and force). A successful enqueue returns HTTP **202** with `data.run_id` and `data.status="queued"`; use `GET /v1/dream/status` to follow it. As with the legacy endpoint, each manual job handles one batch, not necessarily the whole date; use the cursor to check whether more batches remain. Missing queues and failed acceptance return **503**. Without `background:true`, the old synchronous contract remains; dry-runs also stay synchronous.
+
+- A queued/running task blocks another background admission in the same space; `force` does not bypass it. This is not a global lease covering cron and legacy synchronous callers.
+- A single digest/extraction call has a 120-second deadline, including its response body. The two-stage extraction phase has an eight-minute budget and at most three batch reductions. Invalid JSON/schema causes both stages to restart on the same smaller prefix; the suffix remains for a later batch. Empty valid candidates differ from malformed output. A single unusable entry inside an otherwise valid answer (blank, over-long or wrong-typed) is dropped and counted in the logs instead of failing the batch; a wrong container type, a missing candidate list, or a non-empty list in which nothing is usable still counts as malformed. The extraction call has the same output budget as the digest (`DREAM_MAX_TOKENS`, up to 8000). Model/format failure does not advance the cursor or actively delete that batch's raw messages; the separate retention policy still applies.
+- Records older than 20 minutes without confirmed completion are labelled **possibly interrupted / unconfirmed**, not endlessly presented as healthy work. This is a read-only hint, not proof that execution stopped. Old unresolved records require log inspection and explicit operator reconciliation; they are not silently cleared to permit another run. Once you have checked the logs, the panel's **Mark as interrupted** button (or `POST /v1/dream/resolve` with `{"run_id":"…"}`, same `memory:write` scope) closes a queued/running record older than 20 minutes; anything newer or already finished is refused. The record then shows as an error and stops blocking a new task. Whatever it had already written is not rolled back.
+- Each Dream batch leaves a housekeeping draft on that date's diary entry; the real diary replaces it once the date's last batch is done. The nightly cron only writes yesterday's diary, so a manual job, the manual backfill endpoint and the cron backfill now write the diary themselves after a date's last batch (nothing happens until that batch is done, and a diary failure does not undo the Dream). On the Diary page, **Rewrite from the chat** (`POST /admin/diary-rewrite` with `{"date":"YYYY-MM-DD"}`) redoes any day whose chat is still within retention and replaces its current text; it is refused once that week has been rolled up into a weekly entry.
+- A conditional claim prevents duplicate delivery of one job from re-executing its pipeline. This is **not exactly-once completion or automatic crash recovery**: after a claim, ambiguous or partial writes are not automatically replayed. Inspect the run before retrying. The manual follow-up candidate review is retained; its failure does not undo an already completed Dream.
+
 ## Optional features
 
 **Full chat gateway** — let Aelios forward to every vendor's models, billed against your own keys:
@@ -152,6 +164,16 @@ One assistant can write to one space and read from several. A fresh conversation
 3. In `/admin` Settings, put your 32-character account ID as the upstream and add assistants.
 
 Skip all of that and memory recall + the overnight Dream still work (via Workers AI). An AI can do these three steps for you: see [Let an AI set it up](#let-an-ai-set-it-up).
+
+**Choose which models your app lists** — AI Gateway has thousands of models, and a chat app that only lets you pick from the list gets all of them. In `/admin` Settings → **Providers** → Model list, pick the ones you use from the upstream catalog (the `+` button) and type in any name the catalog does not have (custom providers, dynamic routes, suffixes such as `:floor`). The link button beside a listed model sends it one tiny real request, the way a chat client would, and turns into a green dot when it answers; the `−` button takes it off the list. `GET /v1/models` then answers with exactly that list, in the order you added the models. It only changes what is shown: a model that is not on the list can still be called by name, as before. Leave it empty and nothing changes (the whole catalog is shown). With a list saved, the `chatgpt/…` models are shown only if you picked them; the picker lists them first.
+
+**Use your ChatGPT plan** — on a ChatGPT Plus or Pro plan, let your assistant run on the plan instead of an API key (OpenAI's "Sign in with ChatGPT"):
+
+1. `/admin` → Settings → **Providers** → ChatGPT plan → *Continue with ChatGPT*. Sign in and approve.
+2. Your browser then lands on a `127.0.0.1` page that fails to load. That is expected: copy the whole address from the address bar, paste it into the box in `/admin` and press *Finish sign-in*.
+3. Use models named `chatgpt/<model>`. The *Test* button lists what your account can use. To give one memory, add `chatgpt/*` to the assistant's primary models.
+
+Good to know: it connects your own account and nothing else, so don't hand this route to other people. Usage counts against your plan's limits (ChatGPT settings → Usage). Clients speaking chat/completions, Anthropic messages or responses all work (the first two are translated to Responses and back, thinking blocks included), and OpenAI's plan route rejects hosted tools such as image generation, file search, code interpreter and MCP; function tools and web search work. No new secret is needed: the tokens sit encrypted in D1 under a key derived from `CHATBOX_API_KEY`, so changing that key means signing in again. `npm run deploy` applies the new migration. The overnight jobs can use the plan too: put `chatgpt/<model>` in Settings → Dream model (and the diary model if you like). They send several requests a night, all counted against the plan; on a night the plan is out, those jobs fail like any other model error and the memory stays put.
 
 **MCP memory for the Claude app (web and mobile), Claude Code and Codex**:
 
@@ -216,10 +238,13 @@ Configuration has three layers, all under `/admin` Settings: upstream, assistant
 |---|---|---|
 | GET | `/health` | Health check |
 | GET | `/admin` | Admin panel |
-| GET | `/v1/models` | Model list |
+| GET | `/v1/models` | Model list (the upstream catalog, or your saved model list) |
 | POST | `/<assistant>/v1/chat/completions` | OpenAI-compatible chat |
 | POST | `/<assistant>/v1/messages` | Anthropic messages |
 | POST | `/<assistant>/v1/responses` | OpenAI responses |
+| GET | `/api/gateway/models` | Model picker for `/admin` (owner key): every upstream model id, your ChatGPT models, the saved list |
+| POST | `/api/gateway/models/test` | Connectivity test for one model (owner key): `{"model": "…"}` → one tiny chat request, `{ok, status, latency_ms, error?}`; nothing is recorded |
+| GET / POST | `/api/gateway/chatgpt/*` | ChatGPT plan sign-in (owner key): `status`, `login`, `callback`, `test`, `welcome`, `logout` |
 | GET / POST | `/mcp` | MCP memory tools |
 | GET / POST | `/v1/memories` | List / create memories |
 | POST | `/v1/memory/recall` | Dynamic recall (preferred by hooks) |

@@ -9,12 +9,14 @@ import {
 } from "./api/admin";
 import { handleHealth } from "./api/health";
 import { handleVectorBackfill, handleVectorDoctor, handleVectorHealth, handleVectorReindex } from "./api/debug";
-import { handleDreamHarvest, handleDreamRun, handleDreamStatus } from "./api/dream";
+import { handleDreamHarvest, handleDreamResolve, handleDreamRun, handleDreamStatus } from "./api/dream";
 import { handleGateway } from "./gateway/handler";
 import { handleGatewayAdmin, handleGatewayEnv, handleGatewaySpaces, handleRecallHistory } from "./gateway/admin";
 import { identityNamespace, loadConfig, loadSettings, type Protocol } from "./gateway/config";
 import { applySettings } from "./gateway/settings";
 import { handleGuideDogChatCompletions } from "./api/guideDog";
+import { handleChatGptAdmin } from "./chatgpt/admin";
+import { keepChatGptAlive } from "./chatgpt/token";
 import {
   handleGlossaryApi,
   handleIngestMessagesApi,
@@ -29,10 +31,11 @@ import {
 import { handleMcp } from "./api/mcp";
 import { handleNotebookApi } from "./api/notebook";
 import { handleImportApi } from "./api/transfer";
-import { handleModels } from "./api/models";
+import { handleModelCatalog, handleModelTest, handleModels } from "./api/models";
 import { handleRelationsGraph } from "./api/relations";
 import { runCandidateJudge } from "./memory/candidateJudge";
 import { runDailyMemoryDigest, runDreamBackfill } from "./memory/dailyDigest";
+import { writeDiaryAfterDream } from "./memory/diaryWriter";
 import { backfillFts } from "./memory/fts";
 import { runVectorBackfill } from "./memory/vectorBackfill";
 import {
@@ -85,6 +88,10 @@ async function runDailyMemoryDigestBatches(env: Env, namespace: string): Promise
   const backfill = await runDreamBackfill(env, namespace, { maxDates: 2, lookback: 3 });
   for (const item of backfill) {
     results.push({ type: "backfill", date_label: item.dateLabel, result: item.result });
+    // The nightly diary only visits yesterday, so an older date finished here would keep its dream draft as its diary.
+    if (item.result.ran) {
+      results.push({ type: "backfill_diary", date_label: item.dateLabel, result: await writeDiaryAfterDream(env, namespace, item.dateLabel) });
+    }
   }
 
   return results;
@@ -101,21 +108,26 @@ export default {
     if (request.method === "GET" && url.pathname === "/api/gateway/spaces") return handleGatewaySpaces(request, deployed);
 
     if (request.method === "GET" && url.pathname === "/api/gateway/recalls") return handleRecallHistory(request, deployed);
+    if (url.pathname.startsWith("/api/gateway/chatgpt/")) return handleChatGptAdmin(request, deployed, ctx);
 
     const env = applySettings(deployed, await loadSettings(deployed));
+
+    // Reads the same catalog /v1/models does, so it takes the saved gateway ID like the chat routes below.
+    if (request.method === "GET" && url.pathname === "/api/gateway/models") return handleModelCatalog(request, env, ctx);
+    if (request.method === "POST" && url.pathname === "/api/gateway/models/test") return handleModelTest(request, env, ctx);
 
     if (
       request.method === "POST" &&
       (url.pathname === "/v1/guide-dog/chat/completions" || url.pathname === "/guide-dog/v1/chat/completions")
     ) {
-      return handleGuideDogChatCompletions(request, env);
+      return handleGuideDogChatCompletions(request, env, ctx);
     }
 
     const route = gatewayRoute(url.pathname);
     if (route) {
       const protocol = GATEWAY_ENDPOINTS[route.endpoint];
       if (protocol && request.method === "POST") return handleGateway(request, env, ctx, protocol, route.slug);
-      if (route.endpoint === "models" && request.method === "GET") return handleModels(request, env, route.slug);
+      if (route.endpoint === "models" && request.method === "GET") return handleModels(request, env, route.slug, ctx);
     }
 
     if (request.method === "GET" && (url.pathname === "/admin" || url.pathname === "/memory-admin")) {
@@ -241,6 +253,10 @@ export default {
       return handleDreamRun(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/dream/resolve") {
+      return handleDreamResolve(request, env);
+    }
+
     return openAiError("Not found", 404);
   },
 
@@ -266,6 +282,8 @@ export default {
       console.log("scheduled memory maintenance skipped unknown cron", { cron });
       return;
     }
+
+    ctx.waitUntil(keepChatGptAlive(deployed));
 
     ctx.waitUntil(
       (async () => {
