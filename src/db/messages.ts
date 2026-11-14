@@ -1,4 +1,4 @@
-import { upsertMessageFts } from "../memory/fts";
+import { insertMessageFts } from "../memory/fts";
 import type { MessageRecord, OpenAIChatMessage, TokenUsage } from "../types";
 import { sha256Hex } from "../utils/hash";
 import { newId } from "../utils/ids";
@@ -84,6 +84,7 @@ export async function saveUserMessages(
       .run();
 
     // Duplicate hash (client retry): return the existing row id so callers still get a valid message id.
+    // That row was indexed when it was first saved, so only a fresh row needs an FTS entry.
     if ((result.meta.changes ?? 0) === 0) {
       const existing = await db
         .prepare("SELECT id FROM messages WHERE client_message_hash = ? LIMIT 1")
@@ -92,8 +93,8 @@ export async function saveUserMessages(
       ids.push(existing?.id ?? id);
     } else {
       ids.push(id);
+      await insertMessageFts(db, { namespace: input.namespace, messageId: id, content });
     }
-    await upsertMessageFts(db, { namespace: input.namespace, messageId: ids[ids.length - 1], content });
   }
 
   return ids;
@@ -153,7 +154,7 @@ export async function saveAssistantMessage(
     )
     .run();
 
-  await upsertMessageFts(db, { namespace: input.namespace, messageId: id, content: input.content });
+  await insertMessageFts(db, { namespace: input.namespace, messageId: id, content: input.content });
   return id;
 }
 
@@ -280,6 +281,18 @@ export async function listMessagesByNamespaceInRange(
 
 // log_conversation 去重：同一对话里已经存过的 (role, 正文) 不再存第二遍，同一批里重复的也只留一条。
 // 正文按 saveIngestMessages 落库时的同一套清洗比较，空白差异不算不同。
+/**
+ * 删一句原话（后台首页「今天的对话」的删除键）：报错、乱码、突然拒答这种不想留的。
+ * 全文索引一起删，夜里整理、写日记和召回原话都不会再读到它。
+ */
+export async function deleteMessage(db: D1Database, input: { namespace: string; id: string }): Promise<boolean> {
+  const [deleted] = await db.batch([
+    db.prepare("DELETE FROM messages WHERE namespace = ? AND id = ?").bind(input.namespace, input.id),
+    db.prepare("DELETE FROM message_fts WHERE namespace = ? AND message_id = ?").bind(input.namespace, input.id)
+  ]);
+  return (deleted?.meta?.changes ?? 0) > 0;
+}
+
 export async function filterUnsavedMessages(
   db: D1Database,
   input: { namespace: string; conversationId: string; messages: OpenAIChatMessage[] }
@@ -336,7 +349,7 @@ export async function saveIngestMessages(
         seq
       )
       .run();
-    await upsertMessageFts(db, { namespace: input.namespace, messageId: id, content });
+    await insertMessageFts(db, { namespace: input.namespace, messageId: id, content });
     seq += 1;
   }
 

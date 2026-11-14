@@ -88,13 +88,13 @@ test("fresh/refresh status reconstructs an active job and stale jobs show unconf
   app.request = async () => { throw new Error("active tasks must block submission"); };
   await app.triggerDream();
   assert.equal(app.dreamRunResult, null);
-  assert.match(ADMIN_HTML, /force 也不能覆盖/);
+  assert.match(ADMIN_HTML, /「已经整理过的也重来」也盖不过它/);
   assert.match(ADMIN_HTML, /run.status === 'running' && !run.stale/);
 });
 
 test("dry-run results retain proposal/extraction/routing rendering and do not poll", async () => {
-  assert.match(ADMIN_HTML, /预演需保持页面打开/);
-  assert.match(ADMIN_HTML, /预演中，请保持页面打开/);
+  assert.match(ADMIN_HTML, /预览时请保持页面打开/);
+  assert.match(ADMIN_HTML, /预览中，请保持页面打开/);
   const { app, timers } = panel();
   const result = {
     dry_run: true, result: { ran: true }, proposal: { title: "synthetic proposal", memories_to_add: [] },
@@ -217,6 +217,32 @@ test("a diary can be rewritten from its page: confirms, posts the date, reloads 
   assert.match(notices.at(-1) ?? "", /没有重写.*周记/);
   assert.deepEqual(seen, ["/admin/diary-rewrite"]);
   assert.equal(app.diaryRewriting, "");
+});
+
+test("the journal has a monthly tab that lists monthly summaries without daily-only controls", async () => {
+  assert.match(ADMIN_HTML, /@click="diaryMode = 'monthly'; diaryPick = ''; diaryReading = false"/);
+  // Rewrite and source chips belong to daily entries only, so a monthly entry never shows them.
+  assert.match(ADMIN_HTML, /x-show="entry\.date && entry\.sources_kept !== 0"/);
+  assert.match(ADMIN_HTML, /x-show="entry\.date && entry\.sources_kept != null"/);
+
+  const { app } = panel();
+  app.request = async (path: string) => {
+    if (path.startsWith("/admin/diary")) {
+      return { data: { dailies: [], weeklies: [], monthlies: [{ month: "2026-08", title: "八月", summary: "合成月记。", source_week_count: 2 }] } };
+    }
+    throw new Error(`unexpected path ${path}`);
+  };
+  await app.loadDiary();
+  app.diaryMode = "monthly";
+  const items = app.diaryListItems();
+  assert.equal(items.length, 1);
+  assert.equal(items[0].key, "monthly:2026-08");
+  assert.equal(app.diaryCurrent().title, "八月");
+
+  app.lang = "zh";
+  assert.equal(app.monthLabel("2026-08"), "2026年8月");
+  app.lang = "en";
+  assert.equal(app.monthLabel("2026-08"), "August 2026");
 });
 
 test("a declined confirmation or a rewrite already in flight never reaches the API", async () => {

@@ -7,6 +7,22 @@ export const PATHS: Record<Protocol, string> = {
   chat: "chat/completions", messages: "messages", responses: "responses"
 };
 
+/** Second path segment that is a protocol leftover, not a Gateway ID. */
+const NOT_GATEWAY = /^(compat|v1|models|chat|messages|responses)$/i;
+export const GATEWAY_HOST_RE =
+  /^https:\/\/gateway\.ai\.cloudflare\.com\/v1\/([a-f0-9]{32})(?:\/([^/]+))?(?:\/(.*))?$/i;
+
+export function stripAddress(address: string): string {
+  return address.trim().replace(/\/+$/, "");
+}
+
+/** The gateway a pasted gateway URL names, or null (an account ID, a REST URL, or a URL without one). */
+export function gatewayInAddress(address: unknown): string | null {
+  if (typeof address !== "string") return null;
+  const fromUrl = stripAddress(address).match(GATEWAY_HOST_RE);
+  return fromUrl?.[2] && !NOT_GATEWAY.test(fromUrl[2]) ? fromUrl[2] : null;
+}
+
 /** One upstream for the whole gateway. The CF token lives in Worker secrets, never in this config. */
 export interface Upstream {
   /** CF account ID (32 hex chars) or a full base URL ending before the protocol path. */
@@ -23,6 +39,8 @@ export interface Identity {
   models: string[];
   /** Omitted means auto: drop_block on the native Anthropic line, passthrough elsewhere. */
   anthropicThinking?: "auto" | "passthrough" | "drop_block";
+  /** Omitted means on: coding agents are recorded as conversation only (see coding.ts). False records everything. */
+  codingFilter?: boolean;
   maxMemoryChars?: number;
   /** 用户显示名。Dream / 日记 / 周月卷 / 审核写事实时用这个名字，不要写 user/用户。 */
   userName?: string;
@@ -105,6 +123,8 @@ export function validateConfig(value: unknown): GatewayConfig {
       identity.models.every((m: unknown) => text(m) && (m as string).length <= 200),
       `${where}: models must be an array of at most 64 model names`);
     check(identity.anthropicThinking === undefined || ["auto", "passthrough", "drop_block"].includes(identity.anthropicThinking), `${where}: invalid anthropicThinking`);
+    check(identity.codingFilter === undefined || typeof identity.codingFilter === "boolean",
+      `${where}: codingFilter must be true or false`);
     check(identity.maxMemoryChars === undefined || Number.isInteger(identity.maxMemoryChars) && identity.maxMemoryChars >= 256 && identity.maxMemoryChars <= 24000, `${where}: maxMemoryChars must be 256–24000`);
     check(identity.userName === undefined || text(identity.userName) && identity.userName.trim().length <= 32 && !/[\r\n]/.test(identity.userName),
       `${where}: userName must be text (max 32 characters)`);
@@ -126,7 +146,14 @@ export async function loadSettings(env: Env): Promise<Record<string, string>> {
   try {
     const row = await env.DB.prepare("SELECT config_json FROM gateway_config WHERE id = 1").first<{ config_json: string }>();
     const raw = row?.config_json || env.GATEWAY_CONFIG;
-    if (raw) value = validateSettings(JSON.parse(raw).settings);
+    if (raw) {
+      const saved = JSON.parse(raw);
+      value = validateSettings(saved.settings);
+      // A gateway named in the pasted upstream URL wins over AI_GATEWAY_ID for chats (resolveGatewayId).
+      // Background model calls read AI_GATEWAY_ID alone, so it is set here too: every call uses one gateway.
+      const named = gatewayInAddress(saved.upstream?.address);
+      if (named) value = { ...value, AI_GATEWAY_ID: named };
+    }
   } catch { value = {}; }
   settingsCache = { value, expires: Date.now() + 10_000 };
   return value;

@@ -4,14 +4,18 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import worker from "../src/index";
-import { identityNamespace, identityReadNamespaces, invalidateSettingsCache, speakersForNamespace, validateConfig } from "../src/gateway/config";
+import { identityNamespace, identityReadNamespaces, invalidateSettingsCache, loadSettings, speakersForNamespace, validateConfig } from "../src/gateway/config";
+import { applySettings, describeSettings, validateSettings } from "../src/gateway/settings";
 import { appendMemory, classifyTurn, canonical } from "../src/gateway/protocol";
-import { catalogUrl, nativeAnthropic, resolveUpstream, routeFor, rejectedToolFields } from "../src/gateway/upstream";
+import { anthropicClaude, catalogClaude, catalogUrl, forgetRestRefusals, nativeAnthropic, resolveUpstream, restRefused, routeFor, rejectedToolFields } from "../src/gateway/upstream";
+import { callOpenAICompat } from "../src/proxy/openaiAdapter";
 import { OutputCollector, observeResponse, persistExchange, prepareExchange, dispatchExchange } from "../src/gateway/record";
 import { getOrCreateConversation } from "../src/db/conversations";
 import { saveUserMessages } from "../src/db/messages";
+import { backfillFts } from "../src/memory/fts";
 
 import { lexicalOverlapScore, shapeRecallQuery } from "../src/memory/queryShape";
+import { codingClient, codingSpeech, isSpeechTool, stripCodeBlocks } from "../src/gateway/coding";
 
 // Test production modules and SQL with deterministic HTTP and Workers AI doubles.
 (crypto.subtle as any).timingSafeEqual = (a: Uint8Array, b: Uint8Array) => timingSafeEqual(a, b);
@@ -49,6 +53,7 @@ beforeEach(() => {
     catch (e) { sqlite.exec("ROLLBACK"); throw e; }
   } };
   invalidateSettingsCache();
+  forgetRestRefusals();
   calls = []; queue = []; pending = [];
   ctx = { waitUntil(p: Promise<unknown>) { pending.push(p); } };
   env = { DB: db, CHATBOX_API_KEY: "owner-key", IM_API_KEY: "im-key", MEMORY_MCP_API_KEY: "mcp-key",
@@ -110,6 +115,41 @@ test("migrations, native chat recall, namespace isolation, original text and Que
   await run("/v1/chat/completions", continuation);
   assert.deepEqual(calls[1].query.messages, continuation.messages);
   assert.equal(queue[1].kind, "tool"); assert.equal(queue[1].userText, "");
+});
+
+// message_id is UNINDEXED in FTS5: `DELETE FROM message_fts WHERE message_id = ?` reads the whole
+// table, and D1 bills every row. Recording a turn must not pay that on every request.
+function spySql(): string[] {
+  const seen: string[] = [];
+  const base = env.DB;
+  env.DB = { ...base, prepare(sql: string) { seen.push(sql); return base.prepare(sql); } };
+  return seen;
+}
+const ftsScans = (seen: string[]) => seen.filter(sql => /DELETE FROM (message|memory)_fts WHERE (message|memory)_id = \?/.test(sql));
+
+test("recording a turn indexes each new message once without scanning the FTS table", async () => {
+  const seen = spySql();
+  await run("/v1/chat/completions", { model: "partner", messages: [{ role: "user", content: "今晚想吃火锅" }] });
+  await persistExchange(env, queue[0]); await persistExchange(env, queue[0]);
+  assert.deepEqual(ftsScans(seen), []);
+  const indexed = (sqlite.prepare("SELECT message_id FROM message_fts").all() as any[]).map(row => row.message_id).sort();
+  assert.deepEqual(indexed, [queue[0].userId, `${queue[0].id}:assistant`].sort());
+});
+
+test("FTS backfill indexes missing rows without per-row FTS scans", async () => {
+  sqlite.prepare("INSERT INTO conversations (id, namespace, created_at, updated_at) VALUES ('c', 'partner-a', 'x', 'x')").run();
+  for (const [id, content] of [["m-old", "已经有索引的话"], ["m-new", "还没有索引的话"]]) {
+    sqlite.prepare(`INSERT INTO messages (id, conversation_id, namespace, role, content, source, stream, created_at, seq)
+      VALUES (?, 'c', 'partner-a', 'user', ?, 'test', 0, '2026-10-28T00:00:00.000Z', 0)`).run(id, content);
+  }
+  sqlite.prepare("INSERT INTO message_fts (fts_body, namespace, message_id) VALUES ('已经', 'partner-a', 'm-old')").run();
+  const seen = spySql();
+  const result = await backfillFts(env.DB, { namespace: "partner-a", limit: 10 });
+  assert.equal(result.messagesIndexed, 1);
+  assert.deepEqual(ftsScans(seen), []);
+  assert.ok(seen.every(sql => !/LEFT JOIN (message|memory)_fts/.test(sql)));
+  const ids = (sqlite.prepare("SELECT message_id FROM message_fts").all() as any[]).map(row => row.message_id).sort();
+  assert.deepEqual(ids, ["m-new", "m-old"]);
 });
 
 function seedQuote(namespace: string, id: string, role: "user" | "assistant", content: string) {
@@ -702,7 +742,7 @@ test("CF chat rides compat with the gateway id in the URL; custom upstreams stay
   assert.equal(calls[0].headers["cf-aig-authorization"], undefined);
 });
 
-test("every CF paste form routes chat to compat and native protocols to provider endpoints", () => {
+test("every CF paste form routes chat to compat, Claude messages to REST and the rest to provider endpoints", () => {
   const acct = "d121aa7cd60ccebd6213c931efce41da";
   const envLike = {} as any;
   const gw = `https://gateway.ai.cloudflare.com/v1/${acct}/default`;
@@ -727,7 +767,10 @@ test("every CF paste form routes chat to compat and native protocols to provider
     assert.deepEqual(routeFor(resolved, "chat", "openrouter/anthropic/claude-haiku-4.5"),
       { url: `${gw}/compat/chat/completions`, model: "openrouter/anthropic/claude-haiku-4.5", auth: "bearer" }, address);
     assert.deepEqual(routeFor(resolved, "messages", "anthropic/claude-opus-5"),
-      { url: `${gw}/anthropic/v1/messages`, model: "claude-opus-5", auth: "cf-aig" }, address);
+      { url: `https://api.cloudflare.com/client/v4/accounts/${acct}/ai/v1/messages`, model: "anthropic/claude-opus-5",
+        // A pasted URL that names the default gateway names it; an account ID or a REST URL names none.
+        auth: "rest", gateway: address.startsWith(gw) ? "default" : null,
+        fallback: { url: `${gw}/anthropic/v1/messages`, model: "claude-opus-5", auth: "cf-aig" } }, address);
     assert.deepEqual(routeFor(resolved, "responses", "openai/gpt-5.6-luna"),
       { url: `${gw}/openai/responses`, model: "gpt-5.6-luna", auth: "cf-aig" }, address);
     assert.deepEqual(routeFor(resolved, "messages", "custom-navy/claude-opus-5"),
@@ -745,18 +788,183 @@ test("the panel Gateway ID names every CF surface", () => {
   const gw = `https://gateway.ai.cloudflare.com/v1/${acct}/my-gw`;
   assert.equal(catalogUrl(envLike, cfg), `${gw}/compat/models`);
   assert.equal(routeFor(resolved, "chat", "openai/gpt-5.1").url, `${gw}/compat/chat/completions`);
-  assert.equal(routeFor(resolved, "messages", "anthropic/claude-opus-5").url, `${gw}/anthropic/v1/messages`);
+  const claude = routeFor(resolved, "messages", "anthropic/claude-opus-5");
+  assert.equal(claude.url, `https://api.cloudflare.com/client/v4/accounts/${acct}/ai/v1/messages`);
+  assert.equal(claude.gateway, "my-gw");
+  assert.equal(claude.fallback?.url, `${gw}/anthropic/v1/messages`);
+  assert.equal(routeFor(resolved, "messages", "custom-navy/claude-opus-5").url, `${gw}/custom-navy/messages`);
   assert.equal(routeFor(resolved, "responses", "openai/gpt-5.1").url, `${gw}/openai/responses`);
 });
 
-test("messages on CF strips the provider prefix and carries the token as cf-aig-authorization", async () => {
-  setConfig({ ...config(), upstream: { address: "c".repeat(32) } });
-  await run("/v1/messages", { model: "anthropic/claude-opus-5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] });
-  assert.equal(calls[0].url, `https://gateway.ai.cloudflare.com/v1/${"c".repeat(32)}/default/anthropic/v1/messages`);
-  assert.equal(calls[0].query.model, "claude-opus-5");
+test("no gateway named anywhere: REST leaves it to CF, URL surfaces use the account's default", () => {
+  const acct = "f".repeat(32);
+  const cfg = { version: 3 as const, upstream: { address: acct }, identities: [] };
+  const resolved = resolveUpstream({} as any, cfg);
+  assert.equal(resolved.gatewayId, null);
+  assert.equal(routeFor(resolved, "messages", "anthropic/claude-opus-5-5").gateway, null);
+  assert.equal(catalogUrl({} as any, cfg), `https://gateway.ai.cloudflare.com/v1/${acct}/default/compat/models`);
+  // A blank setting is no gateway either.
+  assert.equal(resolveUpstream({ AI_GATEWAY_ID: "  " } as any, cfg).gatewayId, null);
+  // A gateway named in a pasted URL wins over the setting.
+  const pasted = { version: 3 as const, upstream: { address: `https://gateway.ai.cloudflare.com/v1/${acct}/pasted-gw/compat` }, identities: [] };
+  assert.equal(resolveUpstream({ AI_GATEWAY_ID: "panel-gw" } as any, pasted).gatewayId, "pasted-gw");
+});
+
+test("custom providers stay on the gateway URL (REST has none of them), whatever the gateway setting", async () => {
+  const acct = "c".repeat(32);
+  for (const [gatewaySetting, inPath] of [[undefined, "default"], ["", "default"], ["her-gateway", "her-gateway"]]) {
+    const resolved = resolveUpstream({ AI_GATEWAY_ID: gatewaySetting } as any, { version: 3, upstream: { address: acct }, identities: [] });
+    const gw = `https://gateway.ai.cloudflare.com/v1/${acct}/${inPath}`;
+    assert.deepEqual(routeFor(resolved, "chat", "custom-kc/kimi-for-coding"),
+      { url: `${gw}/compat/chat/completions`, model: "custom-kc/kimi-for-coding", auth: "bearer" });
+    assert.deepEqual(routeFor(resolved, "messages", "custom-saki/claude-opus-5-5"),
+      { url: `${gw}/custom-saki/messages`, model: "claude-opus-5-5", auth: "cf-aig" });
+    assert.deepEqual(routeFor(resolved, "responses", "custom-nous/hermes-5"),
+      { url: `${gw}/custom-nous/responses`, model: "hermes-5", auth: "cf-aig" });
+  }
+  setConfig({ ...config(), upstream: { address: acct } });
+  env.AI_GATEWAY_ID = "her-gateway";
+  await run("/v1/messages", { model: "custom-saki/claude-opus-5-5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] });
+  assert.equal(calls[0].url, `https://gateway.ai.cloudflare.com/v1/${acct}/her-gateway/custom-saki/messages`);
   assert.equal(calls[0].headers["cf-aig-authorization"], "Bearer cf-token");
   assert.equal(calls[0].headers.authorization, undefined);
+  assert.equal(calls[0].headers["cf-aig-gateway-id"], undefined);
+});
+
+test("Claude ids go to REST in Cloudflare's catalog spelling", () => {
+  assert.equal(catalogClaude("claude-opus-5-5"), "claude-opus-5.5");
+  assert.equal(catalogClaude("claude-haiku-4-5-20251001"), "claude-haiku-4.5-20251001");
+  assert.equal(catalogClaude("claude-opus-5-5-fast"), "claude-opus-5.5-fast");
+  for (const name of ["claude-opus-5.5", "claude-opus-5", "claude-sonnet-4-20250514", "claude-opus-5-20260101", "claude-3-7-sonnet-20250219"]) {
+    assert.equal(catalogClaude(name), name);
+  }
+  const resolved = resolveUpstream({} as any, { version: 3, upstream: { address: "f".repeat(32) }, identities: [] });
+  // A client may write the version either way: REST gets the catalog's dot, Anthropic's endpoint its own dash.
+  for (const sent of ["anthropic/claude-opus-5-5", "anthropic/claude-opus-5.5"]) {
+    const route = routeFor(resolved, "messages", sent);
+    assert.equal(route.model, "anthropic/claude-opus-5.5", sent);
+    assert.equal(route.fallback?.model, "claude-opus-5-5", sent);
+  }
+  assert.equal(anthropicClaude("claude-haiku-4.5-20251001"), "claude-haiku-4-5-20251001");
+  assert.equal(anthropicClaude("claude-opus-5"), "claude-opus-5");
+});
+
+test("Claude messages on CF go to the REST API: token as bearer, catalog id, gateway in cf-aig-gateway-id", async () => {
+  setConfig({ ...config(), upstream: { address: "c".repeat(32) } });
+  await run("/v1/messages", { model: "anthropic/claude-opus-5-5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] });
+  assert.equal(calls[0].url, `https://api.cloudflare.com/client/v4/accounts/${"c".repeat(32)}/ai/v1/messages`);
+  assert.equal(calls[0].query.model, "anthropic/claude-opus-5.5");
+  assert.equal(calls[0].headers.authorization, "Bearer cf-token");
+  assert.equal(calls[0].headers["cf-aig-authorization"], undefined);
+  assert.equal(calls[0].headers["cf-aig-gateway-id"], undefined);
   assert.equal(calls[0].headers["anthropic-version"], "2023-06-01");
+  env.AI_GATEWAY_ID = "her-gateway";
+  await run("/v1/messages", { model: "anthropic/claude-opus-5-5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] });
+  assert.equal(calls[1].headers["cf-aig-gateway-id"], "her-gateway");
+  assert.equal(calls[1].url, `https://api.cloudflare.com/client/v4/accounts/${"c".repeat(32)}/ai/v1/messages`);
+});
+
+test("what REST alone refuses goes to the provider endpoint; the model's own answers do not", () => {
+  assert.equal(restRefused(404, '{"type":"error","error":{"type":"not_found_error","message":"Model not found: anthropic/claude-x"}}'), "model");
+  assert.equal(restRefused(400, '{"errors":[{"message":"AiError: No such model","code":5007}],"success":false}'), "model");
+  // What /ai/v1/messages answers to a name the catalog lacks (anthropic/anthropic/claude-opus-5.5, checked 2026-11-05).
+  assert.equal(restRefused(400, '{"type":"error","error":{"type":"invalid_request_error","message":"AiError: No such model: No such model anthropic/anthropic/claude-opus-5.5 or task (0b00)"}}'), "model");
+  assert.equal(restRefused(401, '{"errors":[{"code":10000,"message":"Authentication error"}],"success":false}'), "token");
+  assert.equal(restRefused(403, '{"error":{"type":"forbidden","message":"Request not allowed"}}'), null);
+  assert.equal(restRefused(400, '{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: too large"}}'), null);
+  assert.equal(restRefused(429, '{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'), null);
+  // An account whose Unified Billing REST refuses Claude, while the provider endpoint takes it (2026-11-05).
+  const billing = '{"state":"Failed","error":"Unified billing is temporarily unavailable for this provider; retry, or configure your own provider API key (BYOK)."}';
+  for (const status of [400, 402, 403, 503]) assert.equal(restRefused(status, billing), "billing", String(status));
+});
+
+test("REST refusing Unified Billing for the account sends Claude to the provider endpoint", async () => {
+  setConfig({ ...config(), upstream: { address: "c".repeat(32) } });
+  env.AI_GATEWAY_ID = "her-gateway";
+  const mock = globalThis.fetch;
+  globalThis.fetch = async (url: any, init: any) => {
+    if (String(url).startsWith("https://api.cloudflare.com/")) {
+      calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init.headers)), query: JSON.parse(init.body) });
+      return Response.json({ state: "Failed", error: "Unified billing is temporarily unavailable for this provider; retry, or configure your own provider API key (BYOK)." }, { status: 503 });
+    }
+    return mock(url, init);
+  };
+  const { response } = await run("/v1/messages", { model: "anthropic/claude-opus-5.5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].url, `https://gateway.ai.cloudflare.com/v1/${"c".repeat(32)}/her-gateway/anthropic/v1/messages`);
+  assert.equal(calls[1].query.model, "claude-opus-5-5");
+  assert.equal(calls[1].headers["cf-aig-authorization"], "Bearer cf-token");
+});
+
+test("a model REST does not know is sent to the provider endpoint, and skips REST from then on", async () => {
+  setConfig({ ...config(), upstream: { address: "c".repeat(32) } });
+  const mock = globalThis.fetch;
+  globalThis.fetch = async (url: any, init: any) => {
+    if (String(url).startsWith("https://api.cloudflare.com/")) {
+      calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init.headers)), query: JSON.parse(init.body) });
+      return Response.json({ type: "error", error: { type: "not_found_error", message: "Model not found: anthropic/claude-old-1" } }, { status: 404 });
+    }
+    return mock(url, init);
+  };
+  const body = { model: "anthropic/claude-old-1", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] };
+  const first = await run("/v1/messages", body);
+  assert.equal(first.response.status, 200);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].url, `https://gateway.ai.cloudflare.com/v1/${"c".repeat(32)}/default/anthropic/v1/messages`);
+  assert.equal(calls[1].query.model, "claude-old-1");
+  assert.equal(calls[1].headers["cf-aig-authorization"], "Bearer cf-token");
+  assert.equal(calls[1].headers.authorization, undefined);
+  await run("/v1/messages", body);
+  assert.equal(calls.length, 3);
+  assert.match(calls[2].url, /gateway\.ai\.cloudflare\.com/);
+});
+
+test("a token without Workers AI Read keeps Claude working on the provider endpoint", async () => {
+  setConfig({ ...config(), upstream: { address: "c".repeat(32) } });
+  env.AI_GATEWAY_ID = "her-gateway";
+  const mock = globalThis.fetch;
+  globalThis.fetch = async (url: any, init: any) => {
+    if (String(url).startsWith("https://api.cloudflare.com/")) {
+      calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init.headers)), query: JSON.parse(init.body) });
+      return Response.json({ success: false, errors: [{ code: 10000, message: "Authentication error" }] }, { status: 401 });
+    }
+    return mock(url, init);
+  };
+  const first = await run("/v1/messages", { model: "anthropic/claude-opus-5-5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] });
+  assert.equal(first.response.status, 200);
+  assert.equal(calls[1].url, `https://gateway.ai.cloudflare.com/v1/${"c".repeat(32)}/her-gateway/anthropic/v1/messages`);
+  assert.equal(calls[1].headers["cf-aig-gateway-id"], undefined);
+  // Another Claude model skips REST too: the token is the problem, not the model.
+  await run("/v1/messages", { model: "anthropic/claude-haiku-5-5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] });
+  assert.equal(calls.length, 3);
+  assert.match(calls[2].url, /\/her-gateway\/anthropic\/v1\/messages$/);
+});
+
+test("a refusal from the model itself is passed on, not retried elsewhere", async () => {
+  setConfig({ ...config(), upstream: { address: "c".repeat(32) } });
+  globalThis.fetch = async (url: any, init: any) => {
+    calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init.headers)), query: JSON.parse(init.body) });
+    return Response.json({ error: { type: "forbidden", message: "Request not allowed" } }, { status: 403 });
+  };
+  const { response } = await run("/v1/messages", { model: "anthropic/claude-opus-5-5", max_tokens: 16, messages: [{ role: "user", content: "Hi" }] });
+  assert.equal(response.status, 403);
+  assert.equal(calls.length, 1);
+});
+
+test("background model calls use the gateway the chats use", async () => {
+  const used: string[] = [];
+  env.AI = { gateway(id: string) { used.push(id); return { run: async () => Response.json({ choices: [] }) }; } };
+  await callOpenAICompat(env, { model: "deepseek/deepseek-v4-pro", messages: [] } as any);
+  env.AI_GATEWAY_ID = "her-gateway";
+  await callOpenAICompat(env, { model: "deepseek/deepseek-v4-pro", messages: [] } as any);
+  assert.deepEqual(used, ["default", "her-gateway"]);
+  // A gateway named only in the pasted upstream URL reaches them through the saved settings.
+  delete env.AI_GATEWAY_ID;
+  setConfig({ ...config(), upstream: { address: `https://gateway.ai.cloudflare.com/v1/${"c".repeat(32)}/pasted-gw` } });
+  invalidateSettingsCache();
+  await callOpenAICompat(applySettings(env, await loadSettings(env)), { model: "deepseek/deepseek-v4-pro", messages: [] } as any);
+  assert.equal(used[2], "pasted-gw");
 });
 
 test("default thinking mode keeps the tool loop after an injected turn working on Anthropic's own line", async () => {
@@ -830,6 +1038,23 @@ test("any provider gets a native messages/responses route; prefixless models are
   assert.equal(calls.length, 2);
 });
 
+test("the gateway and the Worker's region sit under the upstream; the region is saved only as provider:region", async () => {
+  for (const region of ["aws:ap-southeast-1", "gcp:asia-east1", "azure:southeastasia", " AWS:us-east-1 "]) {
+    assert.equal(validateSettings({ PLACEMENT_REGION: region }).PLACEMENT_REGION, region.trim());
+  }
+  for (const bad of ["ap-southeast-1", "aws", "aws:", "oracle:ap-tokyo-1", "aws:us east 1", "aws:us-east-1;rm"]) {
+    assert.throws(() => validateSettings({ PLACEMENT_REGION: bad }), /provider:region/, bad);
+  }
+  // A bad value is refused when saved, and the saved config stays as it was.
+  const refused = await worker.fetch(request("/api/gateway/config", { settings: { PLACEMENT_REGION: "singapore" } }, {}, "PATCH"), env, ctx);
+  assert.equal(refused.status, 400);
+  const saved = await worker.fetch(request("/api/gateway/config", { settings: { PLACEMENT_REGION: "aws:ap-southeast-1", AI_GATEWAY_ID: "her-gateway" } }, {}, "PATCH"), env, ctx);
+  assert.equal(saved.status, 200);
+  const items = describeSettings({} as any, { PLACEMENT_REGION: "aws:ap-southeast-1" }).groups.flatMap((g: any) => g.items);
+  assert.deepEqual(items.filter((item: any) => item.upstream).map((item: any) => item.name), ["AI_GATEWAY_ID", "PLACEMENT_REGION"]);
+  assert.equal(items.find((item: any) => item.name === "PLACEMENT_REGION").value, "aws:ap-southeast-1");
+});
+
 test("settings edited in the admin page override deployment vars everywhere", async () => {
   const withSettings = { ...config(), settings: { CHAT_MODEL: "chosen-in-admin", MEMORY_FILTER_MAX_OUTPUT: " 5 ", DREAM_TIME_ZONE: "" } };
   assert.equal((await worker.fetch(request("/api/gateway/config", withSettings, {}, "PUT"), env, ctx)).status, 200);
@@ -845,7 +1070,8 @@ test("settings edited in the admin page override deployment vars everywhere", as
   const report = JSON.parse((await run("/api/gateway/env")).text);
   const items = report.groups.flatMap((g: any) => g.items);
   assert.deepEqual(items.find((i: any) => i.name === "CHAT_MODEL").value, "chosen-in-admin");
-  assert.deepEqual(items.find((i: any) => i.name === "VISION_MODEL"), { name: "VISION_MODEL", label: "看图模型", hint: "", value: "", deployed: "deployed-vision" });
+  assert.deepEqual(items.find((i: any) => i.name === "VISION_MODEL"), { name: "VISION_MODEL", label: "看图模型", hint: "", labelEn: "Model for images", hintEn: "", value: "", deployed: "deployed-vision" });
+  assert.equal(report.groups.find((g: any) => g.group === "模型与线路").groupEn, "Models & routing");
   assert.equal(report.secrets.find((x: any) => x.name === "CHATBOX_API_KEY").present, true);
   assert.equal(report.secrets.find((x: any) => x.name === "DEBUG_API_KEY").present, false);
   assert.equal((await worker.fetch(request("/api/gateway/env", undefined, { authorization: "Bearer im-key" }), env, ctx)).status, 401);
@@ -1379,4 +1605,165 @@ test("the model list marks which models get memory under the asking identity; ot
   // The same list under the other identity, reached by its path with the key it allows.
   assert.deepEqual(await mark("/other/v1/models", { authorization: "Bearer im-key" }), {
     "anthropic/claude-opus-4-5": false, partner: false, "chatgpt/gpt-5": true, "openrouter/openai/gpt-6.1-sol:floor": true, "custom-mine/tiny": false });
+});
+
+test("codingClient knows coding agents by header or by shell plus edit tools", () => {
+  const h = (init: Record<string, string>) => new Headers(init);
+  assert.equal(codingClient(h({ "user-agent": "claude-cli/2.1.0 (external, cli)" }), {}), "client:claude-cli");
+  assert.equal(codingClient(h({ originator: "codex_cli_rs", "user-agent": "codex_cli_rs/0.50.0" }), {}), "client:codex");
+  assert.equal(codingClient(h({ "x-title": "Cline", "http-referer": "https://cline.bot" }), {}), "client:cline");
+  assert.equal(codingClient(h({ "x-title": "Roo Code" }), {}), "client:roo code");
+  assert.equal(codingClient(h({ "user-agent": "opencode/0.15.0" }), {}), "client:opencode");
+  // Messages, Chat Completions and Responses tool shapes, including Anthropic's versioned server tools.
+  assert.equal(codingClient(h({}), { tools: [{ name: "Bash" }, { name: "Read" }, { name: "Edit" }] }), "tools:bash+edit");
+  assert.equal(codingClient(h({}), { tools: [{ type: "bash_20250124", name: "bash" }, { type: "text_editor_20250728", name: "str_replace_based_edit_tool" }] }), "tools:bash+strreplacebasededittool");
+  assert.equal(codingClient(h({}), { tools: [{ type: "function", function: { name: "execute_command" } }, { type: "function", function: { name: "replace_in_file" } }] }), "tools:executecommand+replaceinfile");
+  assert.equal(codingClient(h({}), { tools: [{ type: "local_shell" }, { type: "custom", name: "apply_patch" }] }), "tools:localshell+applypatch");
+  // A companion app: chat UAs, memory and web tools, or only one of the two kinds.
+  assert.equal(codingClient(h({ "user-agent": "Mozilla/5.0 Chatbox/1.15" }), { tools: [{ name: "web_search" }, { name: "memory_recall" }, { name: "write_diary" }] }), null);
+  assert.equal(codingClient(h({ "user-agent": "Anthropic/JS 0.60.0" }), { tools: [{ name: "bash" }, { name: "read" }] }), null);
+  assert.equal(codingClient(h({}), {}), null);
+});
+
+test("coding speech keeps words, turns code blocks into [code] and drops code steps", () => {
+  assert.equal(stripCodeBlocks("改成这样：\n```ts\nconst a = 1;\n```\n好了"), "改成这样：\n[code]\n好了");
+  assert.equal(stripCodeBlocks("先看：\n~~~py\nprint(1)\n没关上"), "先看：\n[code]");
+  assert.equal(stripCodeBlocks("行内 `code` 不动"), "行内 `code` 不动");
+  assert.equal(stripCodeBlocks("```\nonly code\n```"), "");
+  const said = (content: unknown[]) => {
+    const out = new OutputCollector("messages", true);
+    out.json({ content, stop_reason: "tool_use" });
+    out.finish();
+    return codingSpeech(out).text;
+  };
+  assert.equal(said([{ type: "text", text: "Let me read it." }, { type: "tool_use", name: "Read", input: { file_path: "a.ts" } }]), "");
+  assert.equal(said([{ type: "text", text: "我去发" }, { type: "tool_use", name: "weixin_send", input: { text: "晚安" } },
+    { type: "tool_use", name: "exec", input: { command: "ls" } }]), "weixin_send {\"text\":\"晚安\"}");
+  assert.equal(said([{ type: "text", text: "改好了。\n```\nx\n```" }]), "改好了。\n[code]");
+  // A speech tool's name is speech words and where they go, nothing else; MCP server names are not judged.
+  for (const name of ["weixin_send", "send_message", "sendMessage", "reply", "tts_speak", "send_sticker", "mcp__weixin__send_message", "send_message_v2"]) assert.ok(isSpeechTool(name), name);
+  for (const name of ["sendKeys", "commit_message", "Read", "mcp__github__create_pull_request", "log_message", "send_file", "send_patch", "AskUserQuestion"]) assert.ok(!isSpeechTool(name), name);
+});
+
+test("coding agents are recorded as conversation only, unless the assistant turns the filter off", async () => {
+  const mock = globalThis.fetch;
+  let reply: any = { content: [{ type: "text", text: "我先看看。" }, { type: "tool_use", id: "r", name: "Read", input: { file_path: "/src/a.ts" } }], stop_reason: "tool_use" };
+  globalThis.fetch = async (url: any, init: any) => {
+    calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers)), query: JSON.parse(init?.body as string) });
+    return Response.json({ model: "claude-test", ...reply });
+  };
+  const claudeCode = { "user-agent": "claude-cli/2.1.0 (external, cli)" };
+  const ask = { role: "user", content: "老公帮我把按钮改蓝\n```css\n.btn { color: red }\n```" };
+  const step = { role: "assistant", content: reply.content };
+  const result = { role: "user", content: [{ type: "tool_result", tool_use_id: "r", content: ".btn { color: red }" }] };
+  try {
+    // Her turn: recorded without the code, and the reply's file read is not.
+    let out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask] }, claudeCode);
+    assert.equal(out.response.headers.get("x-aelios-coding"), "client:claude-cli");
+    assert.equal((sqlite.prepare("SELECT content FROM messages WHERE role = 'user'").get() as any).content, "老公帮我把按钮改蓝\n[code]");
+    assert.equal(queue.length, 1); assert.equal(queue[0].assistantText, "");
+    // A step that only edits code: nothing dispatched at all.
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { old_string: "red", new_string: "blue" } }], stop_reason: "tool_use" };
+    out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(out.response.status, 200);
+    assert.equal(queue.length, 1);
+    // The closing reply is conversation and is kept, code and all turned into [code].
+    reply = { content: [{ type: "text", text: "改好了，现在是蓝色。\n```css\n.btn { color: blue }\n```" }], stop_reason: "end_turn" };
+    await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(queue.length, 2); assert.equal(queue[1].assistantText, "改好了，现在是蓝色。\n[code]");
+    // Filter off: the old behaviour, everything recorded.
+    setConfig(config([{ ...identity(), codingFilter: false } as ReturnType<typeof identity>]));
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { old_string: "red", new_string: "blue" } }], stop_reason: "tool_use" };
+    out = await run("/v1/messages", { model: "partner", max_tokens: 64, messages: [ask, step, result] }, claudeCode);
+    assert.equal(out.response.headers.get("x-aelios-coding"), null);
+    assert.equal(queue.length, 3); assert.match(queue[2].assistantText, /Edit/);
+  } finally { globalThis.fetch = mock; }
+  assert.throws(() => validateConfig({ ...config(), identities: [{ ...identity(), codingFilter: "yes" }] }), /codingFilter/);
+});
+
+test("coding filter: code tool arguments neither crowd out nor smuggle in what is kept", async () => {
+  const mock = globalThis.fetch;
+  let reply: any;
+  globalThis.fetch = async (url: any, init: any) => {
+    calls.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers)), query: JSON.parse(init?.body as string) });
+    return typeof reply === "function" ? reply() : Response.json({ model: "claude-test", ...reply });
+  };
+  const claudeCode = { "user-agent": "claude-cli/2.1.0 (external, cli)" };
+  const ask = { role: "user", content: "帮我改一下" };
+  const loop = (n: number) => [ask, { role: "assistant", content: [{ type: "tool_use", id: `t${n}`, name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: `t${n}`, content: "ok" }] }];
+  const step = async (n: number) => { const before = queue.length;
+    await run("/v1/messages", { model: "partner", max_tokens: 64, messages: loop(n) }, claudeCode);
+    return queue.length > before ? queue.at(-1) : null; };
+  try {
+    // A huge edit next to a message: the message is kept whole, not lost to the 8,000-character cap.
+    reply = { content: [{ type: "tool_use", id: "e", name: "Edit", input: { new_string: "x".repeat(9000) } },
+      { type: "tool_use", id: "w", name: "weixin_send", input: { text: "晚安" } }], stop_reason: "tool_use" };
+    let kept = await step(1);
+    assert.ok(kept); assert.equal(kept.completion, "complete"); assert.match(kept.assistantText, /晚安/); assert.doesNotMatch(kept.assistantText, /xxxx/);
+    // A huge kept call is still held to the cap.
+    reply = { content: [{ type: "tool_use", id: "w", name: "weixin_send", input: { text: "长".repeat(9000) } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    kept = await step(2);
+    assert.ok(kept); assert.ok(kept.assistantText.length <= 8000); assert.equal(kept.completion, "truncated");
+    // Tool names nobody listed are not speech either.
+    reply = { content: [{ type: "text", text: "我开个 PR。" }, { type: "tool_use", id: "g", name: "mcp__github__create_pull_request", input: { body: "diff --git a/x b/x" } }], stop_reason: "tool_use" };
+    assert.equal(await step(3), null);
+    // A failed step is still recorded as failed, for diagnosis, and its retry closes it.
+    const status = () => (sqlite.prepare("SELECT completion_status AS s FROM gateway_exchanges WHERE profile = 'partner' ORDER BY created_at DESC LIMIT 1").get() as any)?.s;
+    reply = () => Response.json({ type: "error", error: { type: "api_error", message: "boom" } }, { status: 500 });
+    assert.equal(await step(4), null);
+    assert.equal(status(), "failed");
+    reply = { content: [{ type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    assert.equal(await step(4), null);
+    assert.equal(status(), "complete"); assert.equal(count("gateway_exchanges"), 1);
+    // A long code block does not push the words after it out of the cap.
+    reply = { content: [{ type: "text", text: `改好了：\n\`\`\`ts\n${"x".repeat(9000)}\n\`\`\`\nDone` }], stop_reason: "end_turn" };
+    kept = await step(5);
+    assert.ok(kept); assert.equal(kept.completion, "complete"); assert.equal(kept.assistantText, "改好了：\n[code]\nDone");
+    // Speech tools are names made only of speech words, and code inside what they say becomes [code].
+    reply = { content: [{ type: "tool_use", id: "p", name: "send_patch", input: { patch: "diff --git a/x b/x" } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    assert.equal(await step(6), null);
+    reply = { content: [{ type: "tool_use", id: "m", name: "mcp__weixin__send_message", input: { text: "看这个\n```js\nconst a = 1\n```\n好吧" } },
+      { type: "tool_use", id: "r", name: "Read", input: {} }], stop_reason: "tool_use" };
+    kept = await step(7);
+    assert.ok(kept); assert.match(kept.assistantText, /\[code\]/); assert.doesNotMatch(kept.assistantText, /const a/);
+  } finally { globalThis.fetch = mock; }
+});
+
+test("coding filter: streamed code is dropped as it arrives, and streamed tool arguments are bounded", () => {
+  const sse = (events: unknown[]) => new TextEncoder().encode(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(""));
+  const text = (t: string) => ({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: t } });
+  const out = new OutputCollector("messages", true);
+  out.chunk(sse([{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, text("看：\n`"), text("``t"), text("s\n")]));
+  for (let i = 0; i < 20; i++) out.chunk(sse([text("y".repeat(1000))]));
+  out.chunk(sse([text("\n``"), text("`\n好了"), { type: "message_delta", delta: { stop_reason: "end_turn" } }, { type: "message_stop" }]));
+  out.finish();
+  assert.deepEqual(codingSpeech(out), { text: "看：\n[code]\n好了", truncated: false });
+  // A huge streamed edit is not held in memory, and does not mark a coding step cut off.
+  const big = new OutputCollector("messages", true);
+  big.chunk(sse([{ type: "content_block_start", index: 1, content_block: { type: "tool_use", name: "Write" } }]));
+  for (let i = 0; i < 100; i++) big.chunk(sse([{ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "z".repeat(1000) } }]));
+  assert.ok((big as any).pending.get(1).json.length <= 64000);
+  big.chunk(sse([{ type: "content_block_stop", index: 1 }, { type: "message_stop" }]));
+  big.finish();
+  assert.deepEqual(codingSpeech(big), { text: "", truncated: false });
+  // Outside coding mode the same call is kept up to the cap and marked cut off.
+  const plain = new OutputCollector("messages");
+  plain.chunk(sse([{ type: "content_block_start", index: 1, content_block: { type: "tool_use", name: "Write" } }]));
+  for (let i = 0; i < 100; i++) plain.chunk(sse([{ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "z".repeat(1000) } }]));
+  plain.chunk(sse([{ type: "content_block_stop", index: 1 }, { type: "message_stop" }]));
+  plain.finish();
+  assert.ok(plain.truncated); assert.ok(plain.text.length <= 8000);
+});
+
+test("coding filter: a longer closing fence ends the block, and earlier code stays out of recall", async () => {
+  assert.equal(stripCodeBlocks("看：\n```\ncode\n````\n后面的话"), "看：\n[code]\n后面的话");
+  assert.equal(stripCodeBlocks("看：\n````\n```\n还在块里\n````\n后面"), "看：\n[code]\n后面");
+  precious("partner-a", "量子猫咪是暗号");
+  await run("/v1/chat/completions", { model: "partner", messages: [
+    { role: "user", content: "看这个\n```\n量子猫咪\n```" }, { role: "assistant", content: "嗯" }, { role: "user", content: "好了吗" }] },
+  { "user-agent": "claude-cli/2.1.0 (external, cli)" });
+  assert.doesNotMatch(JSON.stringify(calls.at(-1).query.messages.at(-1)), /量子猫咪是暗号/);
 });

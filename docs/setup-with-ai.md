@@ -3,7 +3,7 @@
 这份说明是写给 AI 看的。你用 Claude Code、Codex、Cursor 这类能跑命令的 AI，把下面这段话发给它就行：
 
 ```text
-帮我装好、配好 Aelios（我的 AI 记忆网关）。先读 https://raw.githubusercontent.com/wusaki0723/Aelios/main/docs/setup-with-ai.md ，照着做。需要我在浏览器里点、或者需要我自己填 key 的时候，停下来告诉我去哪儿填。
+帮我装好、配好 Aelios（我的 AI 记忆网关）。先读 https://raw.githubusercontent.com/Aelios-project/Aelios/main/docs/setup-with-ai.md ，照着做。需要我在浏览器里点、或者需要我自己填 key 的时候，停下来告诉我去哪儿填。
 ```
 
 从零开始也行，已经装过的也行。配完你会拿到三样东西，填进你平时用的聊天软件就能用：
@@ -74,12 +74,12 @@ cf auth login
 ## 2. 部署（没装过才做）
 
 ```bash
-gh repo fork wusaki0723/Aelios --clone --default-branch-only
+gh repo fork Aelios-project/Aelios --clone --default-branch-only
 cd Aelios
 npm ci
 ```
 
-没有 gh：请用户打开 <https://github.com/wusaki0723/Aelios> 点右上角 **Fork**，把 fork 的地址告诉你，你再 `git clone` 那个地址、`npm ci`。用户没有 GitHub 账号就直接 `git clone https://github.com/wusaki0723/Aelios`，只是以后更新要手动拉。
+没有 gh：请用户打开 <https://github.com/Aelios-project/Aelios> 点右上角 **Fork**，把 fork 的地址告诉你，你再 `git clone` 那个地址、`npm ci`。用户没有 GitHub 账号就直接 `git clone https://github.com/Aelios-project/Aelios`，只是以后更新要手动拉。
 
 部署用 wrangler，它的登录跟 `cf` 是分开的，要用户再点一次允许：
 
@@ -97,7 +97,7 @@ npm run deploy
 - **Vectorize 索引维度不对、里面有数据**：脚本会停下，不会自己删。把原文给用户看，让用户决定。
 - **多个账号选不出来**：命令前带 `CLOUDFLARE_ACCOUNT_ID=<账号 ID>`。
 
-部署完，部署脚本把数据库 ID 和账号 ID 写进了 `wrangler.toml`，那只是这次部署用的，别提交：
+部署完，部署脚本把数据库 ID 和账号 ID（/admin 里设了 Worker 运行地区的，还有 `[placement]`）写进了 `wrangler.toml`，那只是这次部署用的，别提交：
 
 ```bash
 git checkout -- wrangler.toml
@@ -200,7 +200,7 @@ cf accounts tokens permission-groups list --name "Workers%20AI%20Read"
 cf accounts tokens permission-groups list --name "Vectorize%20Read"
 ```
 
-前三个是聊天转发要的；`Vectorize Read` 给维护工具按 Vectorize 列记忆用，找不到可以不加。把 ID 写进一个临时的策略文件（这里面没有秘密）：
+前三个是聊天转发要的：Claude 走 Cloudflare 的 AI REST API（`api.cloudflare.com/…/ai/v1/messages`），那里要 `Workers AI Read`；其余线路要 `AI Gateway Run`。`Vectorize Read` 给维护工具按 Vectorize 列记忆用，找不到可以不加。把 ID 写进一个临时的策略文件（这里面没有秘密）：
 
 ```json
 [{
@@ -219,7 +219,7 @@ V=$(cf accounts tokens create --name aelios-gateway --policies @/tmp/aelios-poli
   && echo 已存; unset V; rm -f /tmp/aelios-policy.json
 ```
 
-建令牌被拒（比如登录的账号没有建令牌的权限）：别反复试。让用户在后台建一把，再自己填进 Worker：AI Gateway → `default` → **Settings** → **Authenticated Gateway** 那里建令牌；然后 **Workers & Pages** → `companion-memory-proxy` → **Settings → Variables and Secrets** → **Add**，类型选 **Secret**，名字 `CLOUDFLARE_API_TOKEN`，值是那把令牌。
+建令牌被拒（比如登录的账号没有建令牌的权限）：别反复试。让用户在后台建一把，再自己填进 Worker：**My Profile → API Tokens → Create Token → Custom token**，权限加上面三个（`AI Gateway Run`、`AI Gateway Read`、`Workers AI Read`，账户选这个账号）。AI Gateway 设置页里「Authenticated Gateway」建的那种只有 `AI Gateway Run`，也能用，只是 Claude 每次都得退回旧接口。然后 **Workers & Pages** → `companion-memory-proxy` → **Settings → Variables and Secrets** → **Add**，类型选 **Secret**，名字 `CLOUDFLARE_API_TOKEN`，值是那把令牌。
 
 ## 6. 配助手
 
@@ -315,7 +315,7 @@ API Key：<钥匙>
 
 ## 导入以前的记忆和聊天记录
 
-整理好的条目直接写进库；聊天记录要先让模型从原话里抽候选，抽出来的进审核页「导入的」那一栏，用户在 `<Worker 地址>/admin` 里点了才算数。先看导入设置，里面有限额、抽取模型和给旧 AI 的提示词：
+整理好的条目直接写进库；聊天记录要先让模型从原话里抽候选，抽出来的进待审页「导入的」那一栏，用户在 `<Worker 地址>/admin` 里点了才算数。先看导入设置，里面有限额、抽取模型和给旧 AI 的提示词：
 
 ```bash
 curl -s "<Worker 地址>/v1/import/info?namespace=default" -H "Authorization: Bearer <钥匙>"
@@ -355,15 +355,15 @@ curl -s "<Worker 地址>/v1/import/info?namespace=default" -H "Authorization: Be
    }
    ```
 
-   - `"direct"` 直接写进库：跟库里一字不差的跳过，跟库里某条很像的不硬写、转去审核页「导入的」等用户定，其余新建；带 `factKey` 的按 key 改写，旧版留着。用户说想一条条过目，才改成 `"review"`，全部先进审核。
-   - 写完把返回的 `counts` 告诉用户：新建 `created`、改写 `updated`、跳过 `unchanged` 和 `duplicate`、转审核 `queued`、失败 `failed`。有 `queued` 的，请用户去 `/admin` → **审核队列** → **导入的** 看一眼。
+   - `"direct"` 直接写进库：跟库里一字不差的跳过，跟库里某条很像的不硬写、转去待审页「导入的」等用户定，其余新建；带 `factKey` 的按 key 改写，旧版留着。用户说想一条条过目，才改成 `"review"`，全部先进审核。
+   - 写完把返回的 `counts` 告诉用户：新建 `created`、改写 `updated`、跳过 `unchanged` 和 `duplicate`、转审核 `queued`、失败 `failed`。有 `queued` 的，请用户去 `/admin` → **待审** → **导入的** 看一眼。
    - 每批 `start_index` 加 25，`fingerprint`、`total` 不变。中途断了，用同一个 `fingerprint` 从断的地方接着发。
 
 ### 聊天记录
 
 聊天记录会一天天交给夜里整理记忆的那个模型（`DREAM_MODEL`）读，抽出候选记忆。要花 Workers AI 的用量，量大时先导两三天的看看效果，再全导。
 
-**最省事：让用户在网页上导。** `<Worker 地址>/admin` → **更多** → **导入导出** → **导入聊天记录**，选文件就行，页面会拆、会切段、显示进度，关了下次选同一个文件接着做。它认：
+**最省事：让用户在网页上导。** `<Worker 地址>/admin` → **导入导出** → **导入聊天记录**，选文件就行，页面会拆、会切段、显示进度，关了下次选同一个文件接着做。它认：
 
 - ChatGPT、Claude 导出的 `conversations.json`
 - 酒馆（SillyTavern）的 `.jsonl`
@@ -393,7 +393,7 @@ curl -s "<Worker 地址>/v1/import/info?namespace=default" -H "Authorization: Be
    ```
 
    `key` 每段不同、不超过 64 个字符；`seq` 在一段里不重复。一段一段串着发，别并发。
-3. 做完告诉用户去 `/admin` → **审核队列** → **导入的** 里挑。
+3. 做完告诉用户去 `/admin` → **待审** → **导入的** 里挑。
 
 ## 附：其它
 

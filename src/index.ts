@@ -11,6 +11,7 @@ import { handleHealth } from "./api/health";
 import { handleVectorBackfill, handleVectorDoctor, handleVectorHealth, handleVectorReindex } from "./api/debug";
 import { handleDreamHarvest, handleDreamResolve, handleDreamRun, handleDreamStatus } from "./api/dream";
 import { handleGateway } from "./gateway/handler";
+import { handleHookIdentities, handleHookRecall, handleHookRecord } from "./gateway/hook";
 import { handleGatewayAdmin, handleGatewayEnv, handleGatewaySpaces, handleRecallHistory } from "./gateway/admin";
 import { identityNamespace, loadConfig, loadSettings, type Protocol } from "./gateway/config";
 import { applySettings } from "./gateway/settings";
@@ -30,6 +31,7 @@ import {
 } from "./api/memories";
 import { handleMcp } from "./api/mcp";
 import { handleNotebookApi } from "./api/notebook";
+import { handleRawMessage } from "./api/raw";
 import { handleImportApi } from "./api/transfer";
 import { handleModelCatalog, handleModelTest, handleModels } from "./api/models";
 import { handleRelationsGraph } from "./api/relations";
@@ -194,6 +196,10 @@ export default {
       return handlePrecious(request, env);
     }
 
+    if (url.pathname.startsWith("/v1/raw/")) {
+      return handleRawMessage(request, env);
+    }
+
     if (url.pathname === "/v1/glossary" || url.pathname.startsWith("/v1/glossary/")) {
       return handleGlossaryApi(request, env);
     }
@@ -219,6 +225,19 @@ export default {
       (url.pathname === "/v1/ingest/messages" || url.pathname === "/v1/messages/ingest")
     ) {
       return handleIngestMessagesApi(request, env, ctx);
+    }
+
+    // Memory for a caller that sends the model request itself (the magpie plugin); nothing goes upstream.
+    if (request.method === "GET" && url.pathname === "/v1/hook/identities") {
+      return handleHookIdentities(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/hook/recall") {
+      return handleHookRecall(request, env, ctx);
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/hook/record") {
+      return handleHookRecord(request, env);
     }
 
     if (request.method === "POST" && url.pathname === "/v1/search/memories") {
